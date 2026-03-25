@@ -32,7 +32,7 @@ carsoo-capture/
 ## Tech Choices
 - **Backend:** FastAPI (Python) for rapid OpenAPI docs and fast iteration.
 - **Frontend:** Next.js 14 PWA for mobile-first seller experience + admin console.
-- **Storage:** Postgres + MinIO (S3-compatible) with pre-signed uploads.
+- **Storage:** Postgres + private MinIO (S3-compatible) with API-proxied uploads and API-served previews.
 
 ## Quick Start (Docker Compose)
 ```bash
@@ -65,6 +65,7 @@ curl -X POST http://localhost:8000/api/admin/seed
 See `.env.example` for defaults. Key entries:
 - `DATABASE_URL`
 - `S3_ENDPOINT`, `S3_BUCKET`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`
+- `API_BASE_URL`
 - `APP_BASE_URL`, `NEXT_PUBLIC_API_BASE`
 
 ## API (OpenAPI)

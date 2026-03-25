@@ -7,8 +7,9 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
 from sqlalchemy.orm import Session
@@ -20,6 +21,7 @@ from .db import get_db
 from .models import capture_sessions, session_assets, session_reviews, users
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3000")
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
 S3_BUCKET = os.getenv("S3_BUCKET", "carsoo-capture")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY", "minioadmin")
@@ -439,7 +441,7 @@ STEP_GROUPS = [
             {
                 "stepKey": "service_records_optional",
                 "title": "Service records",
-                "description": "Upload service history photos or PDFs.",
+                "description": "Upload service history photos.",
                 "example": "/examples/service_records.jpg",
                 "required": False,
                 "minCount": 1,
@@ -448,6 +450,46 @@ STEP_GROUPS = [
         ],
     },
 ]
+
+STEP_MAP = {step["stepKey"]: step for group in STEP_GROUPS for step in group["steps"]}
+STEP_ORDER = [step["stepKey"] for group in STEP_GROUPS for step in group["steps"]]
+
+
+def build_asset_url(asset_id: int) -> str:
+    return f"{API_BASE_URL}/api/assets/{asset_id}/view"
+
+
+def validate_step_and_mime(step_key: str, mime_type: str):
+    step = STEP_MAP.get(step_key)
+    if not step:
+        raise HTTPException(status_code=400, detail="Invalid step key")
+    if not mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
+
+
+def get_recommended_next_step(assets: List[Dict[str, Any]]) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    for asset in assets:
+        step_key = asset["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+
+    required_incomplete: List[str] = []
+    optional_incomplete: List[str] = []
+    for step_key in STEP_ORDER:
+        step = STEP_MAP[step_key]
+        is_complete = counts.get(step_key, 0) >= step["minCount"]
+        if is_complete:
+            continue
+        if step["required"]:
+            required_incomplete.append(step_key)
+        else:
+            optional_incomplete.append(step_key)
+
+    if required_incomplete:
+        return required_incomplete[0]
+    if optional_incomplete:
+        return optional_incomplete[0]
+    return STEP_ORDER[-1] if STEP_ORDER else None
 
 
 @app.get("/api/steps")
@@ -538,9 +580,14 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
         raise HTTPException(status_code=404, detail="Session not found")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
+    asset_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["file_url"] = build_asset_url(asset["id"])
+        asset_payload.append(asset)
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": asset_payload,
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -579,7 +626,7 @@ def export_session(session_id: int, admin=Depends(require_admin), db: Session = 
         asset = row._mapping
         assets_payload.setdefault(asset["step_key"], []).append(
             {
-                "url": asset["file_url"],
+                "url": build_asset_url(asset["id"]),
                 "width": asset["width"],
                 "height": asset["height"],
                 "sizeBytes": asset["size_bytes"],
@@ -618,29 +665,47 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    asset_payload = []
+    raw_assets = []
+    for row in assets:
+        asset = dict(row._mapping)
+        raw_assets.append(asset)
+        asset["file_url"] = build_asset_url(asset["id"])
+        asset_payload.append(asset)
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": asset_payload,
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": get_recommended_next_step(raw_assets),
     }
 
 
 @app.post("/api/sessions/{token}/presign")
 def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
+    get_session_id(db, token)
+    return {
+        "uploadMode": "proxy",
+        "uploadUrl": f"{API_BASE_URL}/api/sessions/{token}/upload",
+        "filename": payload.filename,
+        "mimeType": payload.mime_type,
+    }
+
+
+@app.post("/api/sessions/{token}/upload")
+async def upload_asset(token: str, step_key: str, file: UploadFile = File(...), db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
-    )
-    return {"uploadUrl": url, "s3Key": key}
+    validate_step_and_mime(step_key, file.content_type or "")
+    contents = await file.read()
+    payload = AssetConfirm(step_key=step_key, s3_key=f"sessions/{session_id}/{secrets.token_hex(8)}-{file.filename}", mime_type=file.content_type or "")
+    s3_client.put_object(Bucket=S3_BUCKET, Key=payload.s3_key, Body=contents, ContentType=payload.mime_type)
+    return confirm_asset(token, payload, db)
 
 
 @app.post("/api/sessions/{token}/assets")
 def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    validate_step_and_mime(payload.step_key, payload.mime_type)
     try:
         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
     except s3_client.exceptions.NoSuchKey as exc:
@@ -674,13 +739,13 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         except Exception as exc:  # pylint: disable=broad-except
             raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
     result = db.execute(
         insert(session_assets)
         .values(
             session_id=session_id,
             step_key=payload.step_key,
-            file_url=file_url,
+            s3_key=payload.s3_key,
+            file_url="",
             mime_type=payload.mime_type,
             width=width,
             height=height,
@@ -689,13 +754,32 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         .returning(session_assets.c.id)
     )
     asset_id = result.scalar_one()
+    file_url = build_asset_url(asset_id)
+    db.execute(update(session_assets).where(session_assets.c.id == asset_id).values(file_url=file_url))
     db.commit()
     return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+
+
+@app.get("/api/assets/{asset_id}/view")
+def view_asset(asset_id: int, db: Session = Depends(get_db)):
+    asset_row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    if not asset_row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = asset_row._mapping
+    s3_key = asset["s3_key"]
+    if not s3_key and asset["file_url"] and f"/{S3_BUCKET}/" in asset["file_url"]:
+        s3_key = asset["file_url"].split(f"/{S3_BUCKET}/", maxsplit=1)[1]
+    if not s3_key:
+        raise HTTPException(status_code=404, detail="Asset data unavailable")
+    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    return StreamingResponse(obj["Body"], media_type=asset["mime_type"])
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.agree_documents_redaction:
+        raise HTTPException(status_code=400, detail="Document redaction acknowledgement is required")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
