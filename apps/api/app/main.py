@@ -9,14 +9,16 @@ from botocore.config import Config
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from sqlalchemy import select, insert, update, delete
+from sqlalchemy import select, insert, update, delete, text
 from sqlalchemy.orm import Session
 from passlib.context import CryptContext
 from PIL import Image, ImageOps
 from io import BytesIO
 
 from .db import get_db
+from .db import engine
 from .models import capture_sessions, session_assets, session_reviews, users
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3000")
@@ -30,6 +32,7 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "carsoo-capture")
 ADMIN_SEED_EMAIL = os.getenv("ADMIN_SEED_EMAIL", "admin@carsoo.ai")
 ADMIN_SEED_PASSWORD = os.getenv("ADMIN_SEED_PASSWORD", "admin123")
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "7"))
+PREVIEW_TOKEN_TTL_SECONDS = int(os.getenv("PREVIEW_TOKEN_TTL_SECONDS", "300"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -56,6 +59,7 @@ app.add_middleware(
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -122,6 +126,9 @@ def startup_tasks():
         s3_client.head_bucket(Bucket=S3_BUCKET)
     except Exception:
         s3_client.create_bucket(Bucket=S3_BUCKET)
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE capture_sessions ADD COLUMN IF NOT EXISTS seller_email VARCHAR(128)"))
+        conn.execute(text("ALTER TABLE session_assets ADD COLUMN IF NOT EXISTS s3_key TEXT"))
 
 
 STEP_GROUPS = [
@@ -439,7 +446,7 @@ STEP_GROUPS = [
             {
                 "stepKey": "service_records_optional",
                 "title": "Service records",
-                "description": "Upload service history photos or PDFs.",
+                "description": "Upload service history photos.",
                 "example": "/examples/service_records.jpg",
                 "required": False,
                 "minCount": 1,
@@ -449,10 +456,91 @@ STEP_GROUPS = [
     },
 ]
 
+CORE_REQUIRED_STEPS = {
+    "odometer_closeup",
+    "vin_windshield",
+    "plate_front_or_rear",
+    "keys_photo",
+    "ext_front",
+    "ext_rear",
+    "ext_left_side",
+    "ext_right_side",
+    "int_dashboard_wide",
+    "engine_bay_wide",
+}
+
+
+def get_step_groups() -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for group in STEP_GROUPS:
+        normalized_steps: List[Dict[str, Any]] = []
+        for step in group["steps"]:
+            item = dict(step)
+            item["required"] = item["stepKey"] in CORE_REQUIRED_STEPS
+            normalized_steps.append(item)
+        normalized.append({"group": group["group"], "steps": normalized_steps})
+    return normalized
+
+
+def get_flat_steps() -> List[Dict[str, Any]]:
+    return [step for group in get_step_groups() for step in group["steps"]]
+
+
+def get_asset_counts(asset_rows: List[Any]) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+    return counts
+
+
+def get_next_step_key(asset_rows: List[Any]) -> Optional[str]:
+    counts = get_asset_counts(asset_rows)
+    flat_steps = get_flat_steps()
+    for required in (True, False):
+        for step in flat_steps:
+            if step["required"] != required:
+                continue
+            if counts.get(step["stepKey"], 0) < step["minCount"]:
+                return step["stepKey"]
+    return None
+
+
+def sign_preview_token(session_id: int, asset_id: int) -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "iss": JWT_ISSUER,
+        "kind": "preview",
+        "session_id": session_id,
+        "asset_id": asset_id,
+        "iat": now,
+        "exp": now + timedelta(seconds=PREVIEW_TOKEN_TTL_SECONDS),
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def build_notification_payloads(seller_phone: Optional[str], seller_email: Optional[str], link: str) -> Dict[str, Optional[Dict[str, str]]]:
+    sms_payload = None
+    email_payload = None
+    if seller_phone:
+        sms_payload = {
+            "provider": "placeholder",
+            "to": seller_phone,
+            "message": f"Carsoo photo capture link: {link}",
+        }
+    if seller_email:
+        email_payload = {
+            "provider": "placeholder",
+            "to": seller_email,
+            "subject": "Carsoo capture session",
+            "text": f"Use this secure link to capture your vehicle photos: {link}",
+        }
+    return {"sms": sms_payload, "email": email_payload}
+
 
 @app.get("/api/steps")
 def get_steps():
-    return STEP_GROUPS
+    return get_step_groups()
 
 
 @app.post("/api/admin/seed")
@@ -491,6 +579,7 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
             expires_at=expires_at,
             seller_name=payload.seller_name,
             seller_phone=payload.seller_phone,
+            seller_email=payload.seller_email,
             listing_id=payload.listing_id,
             vin=payload.vin,
             plate=payload.plate,
@@ -503,11 +592,13 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+    link = f"{APP_BASE_URL}/seller/{token}"
     return {
         "id": session_id,
         "token": token,
-        "link": f"{APP_BASE_URL}/seller/{token}",
+        "link": link,
         "expires_at": expires_at,
+        "notifications": build_notification_payloads(payload.seller_phone, payload.seller_email, link),
     }
 
 
@@ -618,11 +709,18 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    assets_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        signed = sign_preview_token(session["id"], asset["id"])
+        asset["preview_url"] = f"/api/sessions/{token}/assets/{asset['id']}/preview?sig={signed}"
+        assets_payload.append(asset)
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": assets_payload,
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": get_next_step_key(assets),
     }
 
 
@@ -641,6 +739,8 @@ def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(ge
 @app.post("/api/sessions/{token}/assets")
 def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
     try:
         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
     except s3_client.exceptions.NoSuchKey as exc:
@@ -680,6 +780,7 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         .values(
             session_id=session_id,
             step_key=payload.step_key,
+            s3_key=payload.s3_key,
             file_url=file_url,
             mime_type=payload.mime_type,
             width=width,
@@ -690,12 +791,23 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    sig = sign_preview_token(session_id, asset_id)
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "previewUrl": f"/api/sessions/{token}/assets/{asset_id}/preview?sig={sig}",
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+        "next_step_key": get_next_step_key(db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()),
+    }
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.agree_documents_redaction:
+        raise HTTPException(status_code=400, detail="Document redaction acknowledgement is required")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
@@ -706,6 +818,30 @@ def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get
     )
     db.commit()
     return {"status": "submitted"}
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def preview_asset(token: str, asset_id: int, sig: str, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    try:
+        claims = jwt.decode(sig, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISSUER)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid preview signature") from exc
+    if claims.get("kind") != "preview" or claims.get("session_id") != session_id or claims.get("asset_id") != asset_id:
+        raise HTTPException(status_code=401, detail="Invalid preview signature")
+    asset = db.execute(
+        select(session_assets).where(
+            session_assets.c.id == asset_id,
+            session_assets.c.session_id == session_id,
+        )
+    ).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    key = asset._mapping.get("s3_key")
+    if not key:
+        raise HTTPException(status_code=404, detail="Asset unavailable")
+    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    return StreamingResponse(obj["Body"], media_type=asset._mapping["mime_type"])
 
 
 @app.post("/api/sessions/{token}/extend")
@@ -730,12 +866,9 @@ def get_session_id(db: Session, token: str) -> int:
 
 def count_missing_required(db: Session, session_id: int) -> int:
     asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
-    counts: Dict[str, int] = {}
-    for row in asset_rows:
-        step_key = row._mapping["step_key"]
-        counts[step_key] = counts.get(step_key, 0) + 1
+    counts = get_asset_counts(asset_rows)
     missing = 0
-    for group in STEP_GROUPS:
+    for group in get_step_groups():
         for step in group["steps"]:
             if step["required"]:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
