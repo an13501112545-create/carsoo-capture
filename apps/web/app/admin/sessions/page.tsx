@@ -20,6 +20,7 @@ export default function AdminSessionsPage() {
   const [form, setForm] = useState({
     seller_name: '',
     seller_phone: '',
+    seller_email: '',
     listing_id: '',
     vin: '',
     plate: '',
@@ -29,6 +30,7 @@ export default function AdminSessionsPage() {
     vehicle_year: ''
   });
   const [link, setLink] = useState('');
+  const [notifications, setNotifications] = useState<any>(null);
 
   const loadSessions = async () => {
     const token = localStorage.getItem('carsoo_admin_token');
@@ -51,6 +53,7 @@ export default function AdminSessionsPage() {
   const createSession = async () => {
     setNotice('');
     setLink('');
+    setNotifications(null);
     const token = localStorage.getItem('carsoo_admin_token');
     if (!token) {
       setNotice('Please login again.');
@@ -67,6 +70,7 @@ export default function AdminSessionsPage() {
     }
     const data = await resp.json();
     setLink(data.link);
+    setNotifications(data.notifications || null);
     await loadSessions();
   };
 
@@ -79,6 +83,8 @@ export default function AdminSessionsPage() {
           {link && (
             <div className="alert">
               Seller link: <a href={link}>{link}</a>
+              {notifications?.sms && <p>SMS preview: {notifications.sms.message}</p>}
+              {notifications?.email && <p>Email preview: {notifications.email.subject}</p>}
             </div>
           )}
           <div className="grid two">
@@ -89,6 +95,10 @@ export default function AdminSessionsPage() {
             <label>
               Seller phone
               <input value={form.seller_phone} onChange={(e) => setForm({ ...form, seller_phone: e.target.value })} />
+            </label>
+            <label>
+              Seller email
+              <input value={form.seller_email} onChange={(e) => setForm({ ...form, seller_email: e.target.value })} />
             </label>
             <label>
               Listing ID
