@@ -3,11 +3,13 @@ import os
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import unquote, urlparse
 
 import boto3
 from botocore.config import Config
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
@@ -27,6 +29,8 @@ S3_SECRET_KEY = os.getenv("S3_SECRET_KEY", "minioadmin")
 S3_REGION = os.getenv("S3_REGION", "us-east-1")
 JWT_SECRET = os.getenv("JWT_SECRET", "dev-secret")
 JWT_ISSUER = os.getenv("JWT_ISSUER", "carsoo-capture")
+ASSET_PROXY_BASE_URL = os.getenv("ASSET_PROXY_BASE_URL", "http://localhost:8000")
+PREVIEW_TOKEN_TTL_SECONDS = int(os.getenv("PREVIEW_TOKEN_TTL_SECONDS", "600"))
 ADMIN_SEED_EMAIL = os.getenv("ADMIN_SEED_EMAIL", "admin@carsoo.ai")
 ADMIN_SEED_PASSWORD = os.getenv("ADMIN_SEED_PASSWORD", "admin123")
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "7"))
@@ -113,6 +117,33 @@ def require_admin(authorization: str = Header(...)) -> Dict[str, Any]:
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
     return payload
+
+
+def build_preview_url(asset_id: int, audience: str, session_id: Optional[int] = None) -> str:
+    payload: Dict[str, Any] = {
+        "iss": JWT_ISSUER,
+        "asset_id": asset_id,
+        "aud": audience,
+        "exp": datetime.now(timezone.utc) + timedelta(seconds=PREVIEW_TOKEN_TTL_SECONDS),
+    }
+    if session_id is not None:
+        payload["session_id"] = session_id
+    token = jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+    return f"{ASSET_PROXY_BASE_URL}/api/assets/{asset_id}/view?token={token}"
+
+
+def serialize_asset(row: Any, audience: str, session_id: Optional[int] = None) -> Dict[str, Any]:
+    asset = dict(row._mapping)
+    asset["preview_url"] = build_preview_url(asset["id"], audience, session_id=session_id)
+    return asset
+
+
+def extract_s3_key(file_url: str) -> str:
+    parsed = urlparse(file_url)
+    marker = f"/{S3_BUCKET}/"
+    if marker in parsed.path:
+        return unquote(parsed.path.split(marker, 1)[1])
+    raise HTTPException(status_code=500, detail="Invalid asset storage URL")
 
 
 
@@ -540,7 +571,7 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [serialize_asset(row, "admin") for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -620,9 +651,10 @@ def get_session(token: str, db: Session = Depends(get_db)):
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [serialize_asset(row, "seller", session_id=session["id"]) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": compute_next_step_key(db, session["id"]),
     }
 
 
@@ -690,7 +722,43 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "previewUrl": build_preview_url(asset_id, "seller", session_id=session_id),
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+        "next_step_key": compute_next_step_key(db, session_id),
+    }
+
+
+@app.get("/api/assets/{asset_id}/view")
+def view_asset(asset_id: int, token: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISSUER, options={"verify_aud": False})
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid preview token") from exc
+    if payload.get("asset_id") != asset_id:
+        raise HTTPException(status_code=403, detail="Preview token does not match asset")
+
+    asset_row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    if not asset_row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = asset_row._mapping
+
+    if payload.get("aud") == "seller":
+        if payload.get("session_id") != asset["session_id"]:
+            raise HTTPException(status_code=403, detail="Seller token/session mismatch")
+    elif payload.get("aud") != "admin":
+        raise HTTPException(status_code=403, detail="Unsupported preview audience")
+
+    s3_key = extract_s3_key(asset["file_url"])
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset file not found") from exc
+    return Response(content=obj["Body"].read(), media_type=asset["mime_type"])
 
 
 @app.post("/api/sessions/{token}/submit")
@@ -726,6 +794,19 @@ def get_session_id(db: Session, token: str) -> int:
     if session["expires_at"] and session["expires_at"] < datetime.now(timezone.utc):
         raise HTTPException(status_code=410, detail="Session expired")
     return session["id"]
+
+
+def compute_next_step_key(db: Session, session_id: int) -> Optional[str]:
+    asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+    for group in STEP_GROUPS:
+        for step in group["steps"]:
+            if counts.get(step["stepKey"], 0) < step["minCount"]:
+                return step["stepKey"]
+    return None
 
 
 def count_missing_required(db: Session, session_id: int) -> int:
