@@ -53,6 +53,7 @@ session_assets = Table(
     Column("id", Integer, primary_key=True),
     Column("session_id", Integer, ForeignKey("capture_sessions.id"), nullable=False),
     Column("step_key", String(64), nullable=False),
+    Column("s3_key", Text, nullable=False),
     Column("file_url", Text, nullable=False),
     Column("thumb_url", Text),
     Column("mime_type", String(64), nullable=False),
