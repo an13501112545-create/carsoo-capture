@@ -2,12 +2,13 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import quote
 from typing import Any, Dict, List, Optional
 
 import boto3
 from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
@@ -30,6 +31,7 @@ JWT_ISSUER = os.getenv("JWT_ISSUER", "carsoo-capture")
 ADMIN_SEED_EMAIL = os.getenv("ADMIN_SEED_EMAIL", "admin@carsoo.ai")
 ADMIN_SEED_PASSWORD = os.getenv("ADMIN_SEED_PASSWORD", "admin123")
 SESSION_TTL_DAYS = int(os.getenv("SESSION_TTL_DAYS", "7"))
+PREVIEW_URL_TTL_SECONDS = int(os.getenv("PREVIEW_URL_TTL_SECONDS", "300"))
 
 pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
@@ -113,6 +115,28 @@ def require_admin(authorization: str = Header(...)) -> Dict[str, Any]:
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
     return payload
+
+
+def is_image_mime(mime_type: str) -> bool:
+    return mime_type.lower().startswith("image/")
+
+
+def generate_preview_token(asset_id: int, session_id: int, s3_key: str) -> str:
+    expires_at = datetime.now(timezone.utc) + timedelta(seconds=PREVIEW_URL_TTL_SECONDS)
+    payload = {
+        "iss": JWT_ISSUER,
+        "sub": f"asset:{asset_id}",
+        "asset_id": asset_id,
+        "session_id": session_id,
+        "s3_key": s3_key,
+        "exp": expires_at,
+    }
+    return jwt.encode(payload, JWT_SECRET, algorithm="HS256")
+
+
+def build_preview_url(asset_id: int, session_id: int, s3_key: str) -> str:
+    token = generate_preview_token(asset_id=asset_id, session_id=session_id, s3_key=s3_key)
+    return f"/api/assets/{asset_id}/preview?token={quote(token)}"
 
 
 
@@ -538,9 +562,18 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
         raise HTTPException(status_code=404, detail="Session not found")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
+    assets_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["preview_url"] = build_preview_url(
+            asset_id=asset["id"],
+            session_id=asset["session_id"],
+            s3_key=asset["s3_key"],
+        )
+        assets_payload.append(asset)
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": assets_payload,
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -579,7 +612,7 @@ def export_session(session_id: int, admin=Depends(require_admin), db: Session = 
         asset = row._mapping
         assets_payload.setdefault(asset["step_key"], []).append(
             {
-                "url": asset["file_url"],
+                "s3Key": asset["s3_key"],
                 "width": asset["width"],
                 "height": asset["height"],
                 "sizeBytes": asset["size_bytes"],
@@ -618,28 +651,95 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    assets_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["preview_url"] = build_preview_url(
+            asset_id=asset["id"],
+            session_id=asset["session_id"],
+            s3_key=asset["s3_key"],
+        )
+        assets_payload.append(asset)
+    next_step_key = get_next_step_key(assets)
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": assets_payload,
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": next_step_key,
     }
 
 
 @app.post("/api/sessions/{token}/presign")
-def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
+def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):  # pylint: disable=unused-argument
+    raise HTTPException(status_code=410, detail="Direct browser presign uploads are deprecated. Use upload proxy endpoint.")
+
+
+@app.post("/api/sessions/{token}/assets/upload")
+def upload_asset(
+    token: str,
+    step_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
+    mime_type = (file.content_type or "").lower()
+    if not is_image_mime(mime_type):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
+
+    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{file.filename or 'capture.jpg'}"
+    data = file.file.read()
+    size_bytes = len(data)
+    if size_bytes > 10 * 1024 * 1024:
+        raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
+
+    try:
+        image = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+        if width < 1600 and height < 1600:
+            raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
+        image_format = image.format or "JPEG"
+        buffer = BytesIO()
+        image.save(buffer, format=image_format)
+        buffer.seek(0)
+        s3_client.put_object(Bucket=S3_BUCKET, Key=key, Body=buffer, ContentType=mime_type)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=400, detail="Invalid image") from exc
+
+    file_url = f"s3://{S3_BUCKET}/{key}"
+    result = db.execute(
+        insert(session_assets)
+        .values(
+            session_id=session_id,
+            step_key=step_key,
+            s3_key=key,
+            file_url=file_url,
+            mime_type=mime_type,
+            width=width,
+            height=height,
+            size_bytes=size_bytes,
+        )
+        .returning(session_assets.c.id)
     )
-    return {"uploadUrl": url, "s3Key": key}
+    asset_id = result.scalar_one()
+    db.commit()
+    return {
+        "id": asset_id,
+        "stepKey": step_key,
+        "previewUrl": build_preview_url(asset_id=asset_id, session_id=session_id, s3_key=key),
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+    }
 
 
 @app.post("/api/sessions/{token}/assets")
 def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
+    if not is_image_mime(payload.mime_type):
+        raise HTTPException(status_code=400, detail="Only image uploads are supported")
     session_id = get_session_id(db, token)
     try:
         obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
@@ -674,12 +774,13 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         except Exception as exc:  # pylint: disable=broad-except
             raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
+    file_url = f"s3://{S3_BUCKET}/{payload.s3_key}"
     result = db.execute(
         insert(session_assets)
         .values(
             session_id=session_id,
             step_key=payload.step_key,
+            s3_key=payload.s3_key,
             file_url=file_url,
             mime_type=payload.mime_type,
             width=width,
@@ -690,12 +791,21 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "previewUrl": build_preview_url(asset_id=asset_id, session_id=session_id, s3_key=payload.s3_key),
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+    }
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.agree_documents_redaction:
+        raise HTTPException(status_code=400, detail="Redaction acknowledgement is required before submission")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
@@ -715,6 +825,33 @@ def extend_session(token: str, db: Session = Depends(get_db)):
     db.execute(update(capture_sessions).where(capture_sessions.c.id == session_id).values(expires_at=expires_at))
     db.commit()
     return {"expires_at": expires_at}
+
+
+@app.get("/api/assets/{asset_id}/preview")
+def preview_asset(asset_id: int, token: str, db: Session = Depends(get_db)):
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=["HS256"], issuer=JWT_ISSUER)
+    except jwt.PyJWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid preview token") from exc
+    if int(payload.get("asset_id", -1)) != asset_id:
+        raise HTTPException(status_code=401, detail="Invalid preview token")
+    row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = row._mapping
+    if asset["session_id"] != int(payload.get("session_id", -1)):
+        raise HTTPException(status_code=401, detail="Invalid preview token")
+    s3_key = payload.get("s3_key")
+    if s3_key != asset["s3_key"]:
+        raise HTTPException(status_code=401, detail="Invalid preview token")
+
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=asset["s3_key"])
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset file missing") from exc
+    from fastapi.responses import StreamingResponse
+
+    return StreamingResponse(obj["Body"], media_type=asset["mime_type"])
 
 
 def get_session_id(db: Session, token: str) -> int:
@@ -741,6 +878,23 @@ def count_missing_required(db: Session, session_id: int) -> int:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
                     missing += 1
     return missing
+
+
+def get_next_step_key(asset_rows: List[Any]) -> Optional[str]:
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+
+    for group in STEP_GROUPS:
+        for step in group["steps"]:
+            if step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+                return step["stepKey"]
+    for group in STEP_GROUPS:
+        for step in group["steps"]:
+            if counts.get(step["stepKey"], 0) < step["minCount"]:
+                return step["stepKey"]
+    return None
 
 
 @app.get("/api/health")
