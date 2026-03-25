@@ -4,40 +4,14 @@ import { useEffect, useMemo, useState } from 'react';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
-interface Asset {
-  id: number;
-  step_key: string;
-  file_url: string;
-}
 
-interface ReviewDecision {
-  step_key: string;
-  decision: string;
-  comment?: string;
-}
 
-interface SessionDetail {
-  session: { id: number; status: string; vin?: string; plate?: string };
-  assets: Asset[];
-  reviews: ReviewDecision[];
-}
 
-interface Step {
-  stepKey: string;
-  title: string;
-  description: string;
-  required: boolean;
-  minCount: number;
-}
 
-interface StepGroup {
-  group: string;
-  steps: Step[];
-}
 
-export default function AdminReviewPage({ params }: { params: { id: string } }) {
-  const [detail, setDetail] = useState<SessionDetail | null>(null);
-  const [groups, setGroups] = useState<StepGroup[]>([]);
+export default function AdminReviewPage({ params }) {
+  const [detail, setDetail] = useState(null);
+  const [groups, setGroups] = useState([]);
   const [notice, setNotice] = useState('');
 
   const load = async () => {
@@ -62,7 +36,7 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
   }, []);
 
   const assetMap = useMemo(() => {
-    const map: Record<string, Asset[]> = {};
+    const map = {};
     detail?.assets.forEach((asset) => {
       if (!map[asset.step_key]) {
         map[asset.step_key] = [];
@@ -73,14 +47,14 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
   }, [detail]);
 
   const reviewState = useMemo(() => {
-    const map: Record<string, ReviewDecision> = {};
+    const map = {};
     detail?.reviews.forEach((review) => {
       map[review.step_key] = { ...review };
     });
     return map;
   }, [detail]);
 
-  const updateReview = (stepKey: string, decision: string, comment?: string) => {
+  const updateReview = (stepKey, decision, comment) => {
     if (!detail) return;
     const nextReviews = { ...reviewState, [stepKey]: { step_key: stepKey, decision, comment } };
     setDetail({ ...detail, reviews: Object.values(nextReviews) });

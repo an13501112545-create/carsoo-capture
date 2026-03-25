@@ -5,17 +5,9 @@ import Link from 'next/link';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
-interface SessionRow {
-  id: number;
-  status: string;
-  vin?: string;
-  plate?: string;
-  created_at: string;
-  missing_required: number;
-}
 
 export default function AdminSessionsPage() {
-  const [sessions, setSessions] = useState<SessionRow[]>([]);
+  const [sessions, setSessions] = useState([]);
   const [notice, setNotice] = useState('');
   const [form, setForm] = useState({
     seller_name: '',

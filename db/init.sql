@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS session_assets (
     id SERIAL PRIMARY KEY,
     session_id INTEGER NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
     step_key VARCHAR(64) NOT NULL,
+    s3_key TEXT NOT NULL,
     file_url TEXT NOT NULL,
     thumb_url TEXT,
     mime_type VARCHAR(64) NOT NULL,
@@ -60,6 +61,9 @@ CREATE TABLE IF NOT EXISTS session_assets (
     uploaded_at TIMESTAMPTZ DEFAULT NOW(),
     checksum VARCHAR(128)
 );
+
+ALTER TABLE session_assets
+    ADD COLUMN IF NOT EXISTS s3_key TEXT;
 
 CREATE TABLE IF NOT EXISTS session_reviews (
     id SERIAL PRIMARY KEY,
