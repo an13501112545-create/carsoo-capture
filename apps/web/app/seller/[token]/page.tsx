@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -38,11 +39,18 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const [reviews, setReviews] = useState<Review[]>([]);
   const [sessionStatus, setSessionStatus] = useState<string>('draft');
   const [missingRequired, setMissingRequired] = useState<number>(0);
-  const [activeStep, setActiveStep] = useState<Step | null>(null);
+  const [activeStepKey, setActiveStepKey] = useState<string>('');
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>('');
   const [agreeDocs, setAgreeDocs] = useState<boolean>(false);
+
+  const allSteps = useMemo(() => groups.flatMap((group) => group.steps), [groups]);
+
+  const activeStep = useMemo(
+    () => allSteps.find((step) => step.stepKey === activeStepKey) || null,
+    [allSteps, activeStepKey]
+  );
 
   useEffect(() => {
     const load = async () => {
@@ -55,6 +63,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
       setMissingRequired(sessionData.missing_required || 0);
+      setActiveStepKey(sessionData.next_step_key || stepsData[0]?.steps?.[0]?.stepKey || '');
       setLoading(false);
     };
     load();
@@ -79,9 +88,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
     return map;
   }, [reviews]);
 
-  const requiredSteps = useMemo(() => {
-    return groups.flatMap((group) => group.steps.filter((step) => step.required));
-  }, [groups]);
+  const requiredSteps = useMemo(() => allSteps.filter((step) => step.required), [allSteps]);
 
   const completedRequired = useMemo(() => {
     return requiredSteps.filter((step) => (assetMap[step.stepKey] || []).length >= step.minCount)
@@ -90,6 +97,16 @@ export default function SellerCapturePage({ params }: { params: { token: string 
 
   const totalRequired = requiredSteps.length;
   const progress = totalRequired ? Math.round((completedRequired / totalRequired) * 100) : 0;
+
+  const activeIndex = allSteps.findIndex((step) => step.stepKey === activeStepKey);
+
+  const moveStep = (direction: -1 | 1) => {
+    if (activeIndex < 0) return;
+    const next = allSteps[activeIndex + direction];
+    if (next) {
+      setActiveStepKey(next.stepKey);
+    }
+  };
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>, step: Step) => {
     if (!event.target.files || event.target.files.length === 0) return;
@@ -118,7 +135,11 @@ export default function SellerCapturePage({ params }: { params: { token: string 
         throw new Error(error.detail || 'Upload failed');
       }
       const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl, preview_url: confirmData.previewUrl }]);
+      setMissingRequired((prev) => Math.max(0, prev - (step.required ? 1 : 0)));
+      if (confirmData.next_step_key) {
+        setActiveStepKey(confirmData.next_step_key);
+      }
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -177,7 +198,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                         key={step.stepKey}
                         className="button secondary"
                         type="button"
-                        onClick={() => setActiveStep(step)}
+                        onClick={() => setActiveStepKey(step.stepKey)}
                       >
                         {step.title} ({count}/{step.minCount})
                         {review?.decision === 'retake' ? ' • Retake' : ''}
@@ -201,6 +222,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                 </div>
               )}
               <p>Required: {activeStep.required ? 'Yes' : 'Optional'} • Min {activeStep.minCount}</p>
+              <p><strong>Example shot:</strong> {activeStep.example}</p>
               <input
                 type="file"
                 accept={activeStep.mode === 'doc' ? 'image/*,application/pdf' : 'image/*'}
@@ -208,10 +230,25 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                 disabled={uploading}
                 onChange={(event) => handleUpload(event, activeStep)}
               />
+              <p style={{ marginTop: '0.75rem' }}>
+                {(assetMap[activeStep.stepKey] || []).length > 0
+                  ? `Captured ${(assetMap[activeStep.stepKey] || []).length} photo(s). Use Retake by shooting again if needed.`
+                  : 'No capture yet. Use the camera button above.'}
+              </p>
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img key={asset.id} src={asset.preview_url || asset.file_url} className="thumb" alt={activeStep.title} />
                 ))}
+              </div>
+              <div style={{ marginTop: '1rem', display: 'flex', gap: '0.5rem', flexWrap: 'wrap' }}>
+                <button className="button secondary" type="button" onClick={() => moveStep(-1)} disabled={activeIndex <= 0}>Back</button>
+                <button className="button secondary" type="button" onClick={() => document.querySelector<HTMLInputElement>('input[type="file"]')?.click()} disabled={uploading}>
+                  {(assetMap[activeStep.stepKey] || []).length > 0 ? 'Retake' : 'Take photo'}
+                </button>
+                {!activeStep.required && (
+                  <button className="button secondary" type="button" onClick={() => moveStep(1)}>Skip for now</button>
+                )}
+                <button className="button" type="button" onClick={() => moveStep(1)} disabled={activeIndex >= allSteps.length - 1}>Next</button>
               </div>
             </div>
           ) : (
