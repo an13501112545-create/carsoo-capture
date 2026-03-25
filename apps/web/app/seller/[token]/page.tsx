@@ -22,7 +22,7 @@ interface StepGroup {
 interface Asset {
   id: number;
   step_key: string;
-  file_url: string;
+  preview_url: string;
 }
 
 interface Review {
@@ -39,6 +39,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const [sessionStatus, setSessionStatus] = useState<string>('draft');
   const [missingRequired, setMissingRequired] = useState<number>(0);
   const [activeStep, setActiveStep] = useState<Step | null>(null);
+  const [nextStepKey, setNextStepKey] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>('');
@@ -55,6 +56,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
       setMissingRequired(sessionData.missing_required || 0);
+      setNextStepKey(sessionData.next_step_key || null);
       setLoading(false);
     };
     load();
@@ -97,28 +99,25 @@ export default function SellerCapturePage({ params }: { params: { token: string 
     setNotice('');
     try {
       const file = event.target.files[0];
-      const presignResp = await fetch(`${API_BASE}/api/sessions/${token}/presign`, {
+      const formData = new FormData();
+      formData.append('step_key', step.stepKey);
+      formData.append('file', file);
+      const uploadResp = await fetch(`${API_BASE}/api/sessions/${token}/assets/upload`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name, mime_type: file.type })
+        body: formData
       });
-      const presignData = await presignResp.json();
-      await fetch(presignData.uploadUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': file.type },
-        body: file
-      });
-      const confirmResp = await fetch(`${API_BASE}/api/sessions/${token}/assets`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step_key: step.stepKey, s3_key: presignData.s3Key, mime_type: file.type })
-      });
-      if (!confirmResp.ok) {
-        const error = await confirmResp.json();
+      if (!uploadResp.ok) {
+        const error = await uploadResp.json();
         throw new Error(error.detail || 'Upload failed');
       }
-      const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      const uploadData = await uploadResp.json();
+      setAssets((prev) => [...prev, { id: uploadData.id, step_key: step.stepKey, preview_url: uploadData.previewUrl }]);
+      const refreshResp = await fetch(`${API_BASE}/api/sessions/${token}`);
+      if (refreshResp.ok) {
+        const refreshData = await refreshResp.json();
+        setMissingRequired(refreshData.missing_required || 0);
+        setNextStepKey(refreshData.next_step_key || null);
+      }
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -155,6 +154,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
           <div style={{ width: `${progress}%` }} />
         </div>
         <p>{progress}% required steps completed ({completedRequired}/{totalRequired}).</p>
+        {nextStepKey && <p>Recommended next step: <strong>{nextStepKey}</strong></p>}
         {notice && <div className="alert">{notice}</div>}
         {missingRequired > 0 && (
           <p className="alert">Missing {missingRequired} required steps before submission.</p>
@@ -210,7 +210,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
               />
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img key={asset.id} src={`${API_BASE}${asset.preview_url}`} className="thumb" alt={activeStep.title} />
                 ))}
               </div>
             </div>
