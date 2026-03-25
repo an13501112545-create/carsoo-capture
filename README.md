@@ -55,11 +55,21 @@ curl -X POST http://localhost:8000/api/admin/seed
 
 ## Basic Flow
 1. Admin logs in (default: `admin@carsoo.ai` / `admin123`).
-2. Admin creates a session and shares the link with seller.
-3. Seller opens link on phone and follows step-by-step capture.
-4. Seller submits session.
-5. Admin reviews and sets PASS / RETAKE decisions.
-6. Export dealer package JSON.
+2. Admin creates a session and shares the generated secure seller link.
+3. Seller opens link on phone and follows one-step-at-a-time camera capture.
+4. Each captured photo uploads immediately; required steps auto-advance.
+5. Seller can submit once the core required set is complete (optional steps can be skipped).
+6. Admin reviews and sets PASS / RETAKE decisions.
+7. Export dealer package JSON.
+
+## Seller Camera-First Capture Flow
+- The seller page now runs as a mobile-first guided wizard with one active step at a time.
+- Primary action is **Take photo** using `accept=\"image/*\"` and `capture=\"environment\"` (browser fallback still allows regular file picker).
+- Optional steps expose **Skip for now**; required steps do not.
+- After photo selection, the app shows preview + **Retake** + **Next** while upload happens immediately.
+- Progress is persisted by uploaded assets and the step cursor (local storage per token) so sellers can resume the same link later.
+- Submission now checks only the core required set (10 critical photos), while all other steps are additional/optional.
+- Admin session creation now returns placeholder SMS/email payloads for notification services, without hard-coding Twilio/SendGrid integrations.
 
 ## Environment Variables
 See `.env.example` for defaults. Key entries:
