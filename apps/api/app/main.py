@@ -18,6 +18,7 @@ from io import BytesIO
 
 from .db import get_db
 from .models import capture_sessions, session_assets, session_reviews, users
+from .services.notifications import PlaceholderEmailProvider, PlaceholderSMSProvider, SellerNotificationService
 
 APP_BASE_URL = os.getenv("APP_BASE_URL", "http://localhost:3000")
 S3_ENDPOINT = os.getenv("S3_ENDPOINT", "http://minio:9000")
@@ -52,10 +53,16 @@ app.add_middleware(
     allow_headers=["*"]
 )
 
+notification_service = SellerNotificationService(
+    sms_provider=PlaceholderSMSProvider(),
+    email_provider=PlaceholderEmailProvider(),
+)
+
 
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -151,7 +158,7 @@ STEP_GROUPS = [
                 "title": "VIN door jamb",
                 "description": "Photograph the VIN label on the door jamb.",
                 "example": "/examples/vin_door.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -169,7 +176,7 @@ STEP_GROUPS = [
                 "title": "Keys",
                 "description": "Photograph the key fob and spare keys if any.",
                 "example": "/examples/keys.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -183,7 +190,7 @@ STEP_GROUPS = [
                 "title": "Front",
                 "description": "Front view of the vehicle.",
                 "example": "/examples/ext_front.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -210,7 +217,7 @@ STEP_GROUPS = [
                 "title": "Rear",
                 "description": "Rear view of the vehicle.",
                 "example": "/examples/ext_rear.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -237,7 +244,7 @@ STEP_GROUPS = [
                 "title": "Left side",
                 "description": "Driver-side profile.",
                 "example": "/examples/ext_left.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -246,7 +253,7 @@ STEP_GROUPS = [
                 "title": "Right side",
                 "description": "Passenger-side profile.",
                 "example": "/examples/ext_right.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -287,7 +294,7 @@ STEP_GROUPS = [
                 "title": "Center console",
                 "description": "Center console and shifter.",
                 "example": "/examples/int_console.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -296,7 +303,7 @@ STEP_GROUPS = [
                 "title": "Infotainment on",
                 "description": "Power on the infotainment screen.",
                 "example": "/examples/int_infotainment.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -314,7 +321,7 @@ STEP_GROUPS = [
                 "title": "Rear seats",
                 "description": "Rear seating area.",
                 "example": "/examples/int_rear_seats.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -323,7 +330,7 @@ STEP_GROUPS = [
                 "title": "Driver door panel",
                 "description": "Driver door panel and controls.",
                 "example": "/examples/int_door.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -341,7 +348,7 @@ STEP_GROUPS = [
                 "title": "Trunk open",
                 "description": "Open trunk view.",
                 "example": "/examples/int_trunk.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -373,7 +380,7 @@ STEP_GROUPS = [
                 "title": "Front left tire tread",
                 "description": "Tread depth close-up.",
                 "example": "/examples/tire_fl.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -382,7 +389,7 @@ STEP_GROUPS = [
                 "title": "Front right tire tread",
                 "description": "Tread depth close-up.",
                 "example": "/examples/tire_fr.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -391,7 +398,7 @@ STEP_GROUPS = [
                 "title": "Rear left tire tread",
                 "description": "Tread depth close-up.",
                 "example": "/examples/tire_rl.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -400,7 +407,7 @@ STEP_GROUPS = [
                 "title": "Rear right tire tread",
                 "description": "Tread depth close-up.",
                 "example": "/examples/tire_rr.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -409,7 +416,7 @@ STEP_GROUPS = [
                 "title": "Wheel/rim damage",
                 "description": "Close-ups of any rim damage.",
                 "example": "/examples/rim.jpg",
-                "required": True,
+                "required": False,
                 "minCount": 1,
                 "mode": "photo",
             },
@@ -491,6 +498,7 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
             expires_at=expires_at,
             seller_name=payload.seller_name,
             seller_phone=payload.seller_phone,
+            seller_email=payload.seller_email,
             listing_id=payload.listing_id,
             vin=payload.vin,
             plate=payload.plate,
@@ -503,11 +511,20 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+    link = f"{APP_BASE_URL}/seller/{token}"
+    notifications = notification_service.prepare_capture_messages(
+        capture_url=link,
+        seller_name=payload.seller_name,
+        seller_phone=payload.seller_phone,
+        seller_email=payload.seller_email,
+        session_id=session_id,
+    )
     return {
         "id": session_id,
         "token": token,
-        "link": f"{APP_BASE_URL}/seller/{token}",
+        "link": link,
         "expires_at": expires_at,
+        "notifications": notifications,
     }
 
 
@@ -543,6 +560,22 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
         "assets": [dict(row._mapping) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
     }
+
+
+@app.get("/api/admin/sessions/{session_id}/notification-preview")
+def get_notification_preview(session_id: int, admin=Depends(require_admin), db: Session = Depends(get_db)):
+    session_row = db.execute(select(capture_sessions).where(capture_sessions.c.id == session_id)).first()
+    if not session_row:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session = session_row._mapping
+    capture_url = f"{APP_BASE_URL}/seller/{{secure_token_for_session_{session_id}}}"
+    return notification_service.prepare_capture_messages(
+        capture_url=capture_url,
+        seller_name=session["seller_name"],
+        seller_phone=session["seller_phone"],
+        seller_email=session["seller_email"],
+        session_id=session["id"],
+    )
 
 
 @app.post("/api/admin/sessions/{session_id}/review")
@@ -618,11 +651,13 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    progress = get_progress_summary(db, session["id"])
     return {
         "session": dict(session),
         "assets": [dict(row._mapping) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
-        "missing_required": count_missing_required(db, session["id"]),
+        "missing_required": progress["required_remaining"],
+        "progress": progress,
     }
 
 
@@ -696,7 +731,7 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
-    missing = count_missing_required(db, session_id)
+    missing = get_progress_summary(db, session_id)["required_remaining"]
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
     db.execute(
@@ -729,18 +764,43 @@ def get_session_id(db: Session, token: str) -> int:
 
 
 def count_missing_required(db: Session, session_id: int) -> int:
+    return get_progress_summary(db, session_id)["required_remaining"]
+
+
+def get_step_counts(db: Session, session_id: int) -> Dict[str, int]:
     asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     counts: Dict[str, int] = {}
     for row in asset_rows:
         step_key = row._mapping["step_key"]
         counts[step_key] = counts.get(step_key, 0) + 1
-    missing = 0
+    return counts
+
+
+def get_progress_summary(db: Session, session_id: int) -> Dict[str, int]:
+    counts = get_step_counts(db, session_id)
+    required_total = 0
+    required_complete = 0
+    optional_total = 0
+    optional_complete = 0
     for group in STEP_GROUPS:
         for step in group["steps"]:
+            is_complete = counts.get(step["stepKey"], 0) >= step["minCount"]
             if step["required"]:
-                if counts.get(step["stepKey"], 0) < step["minCount"]:
-                    missing += 1
-    return missing
+                required_total += 1
+                if is_complete:
+                    required_complete += 1
+            else:
+                optional_total += 1
+                if is_complete:
+                    optional_complete += 1
+    return {
+        "required_total": required_total,
+        "required_complete": required_complete,
+        "required_remaining": required_total - required_complete,
+        "optional_total": optional_total,
+        "optional_complete": optional_complete,
+        "optional_remaining": optional_total - optional_complete,
+    }
 
 
 @app.get("/api/health")

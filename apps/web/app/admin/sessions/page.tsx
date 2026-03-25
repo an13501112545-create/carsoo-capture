@@ -20,6 +20,7 @@ export default function AdminSessionsPage() {
   const [form, setForm] = useState({
     seller_name: '',
     seller_phone: '',
+    seller_email: '',
     listing_id: '',
     vin: '',
     plate: '',
@@ -29,6 +30,7 @@ export default function AdminSessionsPage() {
     vehicle_year: ''
   });
   const [link, setLink] = useState('');
+  const [notificationPreview, setNotificationPreview] = useState<any>(null);
 
   const loadSessions = async () => {
     const token = localStorage.getItem('carsoo_admin_token');
@@ -51,6 +53,7 @@ export default function AdminSessionsPage() {
   const createSession = async () => {
     setNotice('');
     setLink('');
+    setNotificationPreview(null);
     const token = localStorage.getItem('carsoo_admin_token');
     if (!token) {
       setNotice('Please login again.');
@@ -67,6 +70,7 @@ export default function AdminSessionsPage() {
     }
     const data = await resp.json();
     setLink(data.link);
+    setNotificationPreview(data.notifications || null);
     await loadSessions();
   };
 
@@ -89,6 +93,10 @@ export default function AdminSessionsPage() {
             <label>
               Seller phone
               <input value={form.seller_phone} onChange={(e) => setForm({ ...form, seller_phone: e.target.value })} />
+            </label>
+            <label>
+              Seller email
+              <input value={form.seller_email} onChange={(e) => setForm({ ...form, seller_email: e.target.value })} />
             </label>
             <label>
               Listing ID
@@ -122,6 +130,11 @@ export default function AdminSessionsPage() {
           <button className="button" style={{ marginTop: '1rem' }} onClick={createSession}>
             Generate link
           </button>
+          {notificationPreview && (
+            <pre style={{ marginTop: '1rem', whiteSpace: 'pre-wrap' }}>
+              {JSON.stringify(notificationPreview, null, 2)}
+            </pre>
+          )}
         </div>
 
         <div className="card">
