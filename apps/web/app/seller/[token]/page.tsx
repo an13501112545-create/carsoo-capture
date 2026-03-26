@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -43,6 +44,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const [uploading, setUploading] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>('');
   const [agreeDocs, setAgreeDocs] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
     const load = async () => {
@@ -55,6 +57,14 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
       setMissingRequired(sessionData.missing_required || 0);
+      if (sessionData.next_step_key) {
+        const nextStep = stepsData
+          .flatMap((group: StepGroup) => group.steps)
+          .find((step: Step) => step.stepKey === sessionData.next_step_key);
+        if (nextStep) {
+          setActiveStep(nextStep);
+        }
+      }
       setLoading(false);
     };
     load();
@@ -97,28 +107,25 @@ export default function SellerCapturePage({ params }: { params: { token: string 
     setNotice('');
     try {
       const file = event.target.files[0];
-      const presignResp = await fetch(`${API_BASE}/api/sessions/${token}/presign`, {
+      const formData = new FormData();
+      formData.append('step_key', step.stepKey);
+      formData.append('file', file);
+      const uploadResp = await fetch(`${API_BASE}/api/sessions/${token}/assets`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name, mime_type: file.type })
+        body: formData
       });
-      const presignData = await presignResp.json();
-      await fetch(presignData.uploadUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': file.type },
-        body: file
-      });
-      const confirmResp = await fetch(`${API_BASE}/api/sessions/${token}/assets`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step_key: step.stepKey, s3_key: presignData.s3Key, mime_type: file.type })
-      });
-      if (!confirmResp.ok) {
-        const error = await confirmResp.json();
+      if (!uploadResp.ok) {
+        const error = await uploadResp.json();
         throw new Error(error.detail || 'Upload failed');
       }
-      const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      const uploadData = await uploadResp.json();
+      setAssets((prev) => [...prev, { id: uploadData.id, step_key: step.stepKey, file_url: uploadData.fileUrl, preview_url: uploadData.preview_url }]);
+      if (uploadData.next_step_key) {
+        const nextStep = groups.flatMap((group) => group.steps).find((candidate) => candidate.stepKey === uploadData.next_step_key);
+        if (nextStep) {
+          setActiveStep(nextStep);
+        }
+      }
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -202,15 +209,47 @@ export default function SellerCapturePage({ params }: { params: { token: string 
               )}
               <p>Required: {activeStep.required ? 'Yes' : 'Optional'} • Min {activeStep.minCount}</p>
               <input
+                ref={fileInputRef}
                 type="file"
-                accept={activeStep.mode === 'doc' ? 'image/*,application/pdf' : 'image/*'}
+                accept="image/*"
                 capture="environment"
                 disabled={uploading}
                 onChange={(event) => handleUpload(event, activeStep)}
+                style={{ display: 'none' }}
               />
+              <div style={{ display: 'flex', gap: '0.5rem', marginTop: '0.5rem' }}>
+                <button type="button" className="button secondary" onClick={() => setActiveStep(null)} disabled={uploading}>Back</button>
+                <button type="button" className="button" onClick={() => fileInputRef.current?.click()} disabled={uploading}>
+                  {(assetMap[activeStep.stepKey] || []).length > 0 ? 'Retake' : 'Take photo'}
+                </button>
+                <button
+                  type="button"
+                  className="button secondary"
+                  onClick={() => {
+                    const all = groups.flatMap((group) => group.steps);
+                    const idx = all.findIndex((step) => step.stepKey === activeStep.stepKey);
+                    if (idx >= 0 && idx < all.length - 1) setActiveStep(all[idx + 1]);
+                  }}
+                >
+                  Next
+                </button>
+                {!activeStep.required && (
+                  <button
+                    type="button"
+                    className="button secondary"
+                    onClick={() => {
+                      const all = groups.flatMap((group) => group.steps);
+                      const idx = all.findIndex((step) => step.stepKey === activeStep.stepKey);
+                      if (idx >= 0 && idx < all.length - 1) setActiveStep(all[idx + 1]);
+                    }}
+                  >
+                    Skip for now
+                  </button>
+                )}
+              </div>
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img key={asset.id} src={asset.preview_url || asset.file_url} className="thumb" alt={activeStep.title} />
                 ))}
               </div>
             </div>
