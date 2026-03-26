@@ -2,6 +2,7 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import boto3
@@ -9,6 +10,7 @@ from botocore.config import Config
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
 from sqlalchemy.orm import Session
@@ -56,6 +58,7 @@ app.add_middleware(
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -449,10 +452,35 @@ STEP_GROUPS = [
     },
 ]
 
+CORE_REQUIRED_STEP_KEYS = {
+    "odometer_closeup",
+    "vin_windshield",
+    "plate_front_or_rear",
+    "keys_photo",
+    "ext_front",
+    "ext_rear",
+    "ext_left_side",
+    "ext_right_side",
+    "int_dashboard_wide",
+    "engine_bay_wide",
+}
+
+
+def get_normalized_step_groups() -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for group in STEP_GROUPS:
+        normalized_steps: List[Dict[str, Any]] = []
+        for step in group["steps"]:
+            normalized_step = dict(step)
+            normalized_step["required"] = normalized_step["stepKey"] in CORE_REQUIRED_STEP_KEYS
+            normalized_steps.append(normalized_step)
+        normalized.append({**group, "steps": normalized_steps})
+    return normalized
+
 
 @app.get("/api/steps")
 def get_steps():
-    return STEP_GROUPS
+    return get_normalized_step_groups()
 
 
 @app.post("/api/admin/seed")
@@ -503,11 +531,24 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+    notifications: Dict[str, Any] = {}
+    if payload.seller_phone:
+        notifications["sms"] = {
+            "to": payload.seller_phone,
+            "message": f"Please upload vehicle photos: {APP_BASE_URL}/seller/{token}",
+        }
+    if payload.seller_email:
+        notifications["email"] = {
+            "to": payload.seller_email,
+            "subject": "Vehicle photo capture link",
+            "body": f"Please upload vehicle photos using this link: {APP_BASE_URL}/seller/{token}",
+        }
     return {
         "id": session_id,
         "token": token,
         "link": f"{APP_BASE_URL}/seller/{token}",
         "expires_at": expires_at,
+        "notifications": notifications,
     }
 
 
@@ -540,7 +581,7 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [serialize_asset_admin(row._mapping, session_id) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -620,22 +661,16 @@ def get_session(token: str, db: Session = Depends(get_db)):
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [serialize_asset_seller(row._mapping, token) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": get_next_step_key(db, session["id"]),
     }
 
 
 @app.post("/api/sessions/{token}/presign")
 def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
-    session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
-    )
-    return {"uploadUrl": url, "s3Key": key}
+    raise HTTPException(status_code=410, detail="Deprecated: upload directly to /api/sessions/{token}/assets with multipart form data")
 
 
 @app.post("/api/sessions/{token}/assets")
@@ -674,7 +709,7 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         except Exception as exc:  # pylint: disable=broad-except
             raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
+    file_url = f"s3://{S3_BUCKET}/{payload.s3_key}"
     result = db.execute(
         insert(session_assets)
         .values(
@@ -690,12 +725,21 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+        "next_step_key": get_next_step_key(db, session_id),
+    }
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.agree_documents_redaction:
+        raise HTTPException(status_code=400, detail="Document redaction acknowledgement is required")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
@@ -735,12 +779,96 @@ def count_missing_required(db: Session, session_id: int) -> int:
         step_key = row._mapping["step_key"]
         counts[step_key] = counts.get(step_key, 0) + 1
     missing = 0
-    for group in STEP_GROUPS:
+    for group in get_normalized_step_groups():
         for step in group["steps"]:
             if step["required"]:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
                     missing += 1
     return missing
+
+
+def get_next_step_key(db: Session, session_id: int) -> Optional[str]:
+    asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+
+    normalized = get_normalized_step_groups()
+    for required in (True, False):
+        for group in normalized:
+            for step in group["steps"]:
+                if step["required"] != required:
+                    continue
+                if counts.get(step["stepKey"], 0) < step["minCount"]:
+                    return step["stepKey"]
+    return None
+
+
+def serialize_asset_seller(asset: Dict[str, Any], token: str) -> Dict[str, Any]:
+    serialized = dict(asset)
+    serialized["preview_url"] = f"/api/sessions/{token}/assets/{asset['id']}/preview"
+    return serialized
+
+
+def serialize_asset_admin(asset: Dict[str, Any], session_id: int) -> Dict[str, Any]:
+    serialized = dict(asset)
+    serialized["preview_url"] = f"/api/admin/sessions/{session_id}/assets/{asset['id']}/preview"
+    return serialized
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def preview_asset(token: str, asset_id: int, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    asset_row = db.execute(
+        select(session_assets).where(session_assets.c.id == asset_id, session_assets.c.session_id == session_id)
+    ).first()
+    if not asset_row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = asset_row._mapping
+    s3_key = extract_s3_key(asset)
+    if not s3_key:
+        raise HTTPException(status_code=500, detail="Asset storage key unavailable")
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset object not found") from exc
+    content_type = asset.get("mime_type") or obj.get("ContentType") or "application/octet-stream"
+    return StreamingResponse(obj["Body"], media_type=content_type)
+
+
+@app.get("/api/admin/sessions/{session_id}/assets/{asset_id}/preview")
+def preview_asset_admin(session_id: int, asset_id: int, admin=Depends(require_admin), db: Session = Depends(get_db)):
+    asset_row = db.execute(
+        select(session_assets).where(session_assets.c.id == asset_id, session_assets.c.session_id == session_id)
+    ).first()
+    if not asset_row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = asset_row._mapping
+    s3_key = extract_s3_key(asset)
+    if not s3_key:
+        raise HTTPException(status_code=500, detail="Asset storage key unavailable")
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset object not found") from exc
+    content_type = asset.get("mime_type") or obj.get("ContentType") or "application/octet-stream"
+    return StreamingResponse(obj["Body"], media_type=content_type)
+
+
+def extract_s3_key(asset: Dict[str, Any]) -> Optional[str]:
+    if asset.get("s3_key"):
+        return str(asset["s3_key"])
+    file_url = asset.get("file_url")
+    if not file_url:
+        return None
+    if str(file_url).startswith(f"s3://{S3_BUCKET}/"):
+        return str(file_url).replace(f"s3://{S3_BUCKET}/", "", 1)
+    parsed = urlparse(str(file_url))
+    path = parsed.path.lstrip("/")
+    if path.startswith(f"{S3_BUCKET}/"):
+        return path.replace(f"{S3_BUCKET}/", "", 1)
+    return None
 
 
 @app.get("/api/health")

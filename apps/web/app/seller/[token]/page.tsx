@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -55,6 +56,11 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
       setMissingRequired(sessionData.missing_required || 0);
+      const allSteps: Step[] = stepsData.flatMap((group: StepGroup) => group.steps);
+      const recommended = sessionData.next_step_key
+        ? allSteps.find((step) => step.stepKey === sessionData.next_step_key) || null
+        : null;
+      setActiveStep(recommended || allSteps[0] || null);
       setLoading(false);
     };
     load();
@@ -119,6 +125,13 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       }
       const confirmData = await confirmResp.json();
       setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      if (confirmData.next_step_key) {
+        const allSteps = groups.flatMap((group) => group.steps);
+        const nextStep = allSteps.find((candidate) => candidate.stepKey === confirmData.next_step_key) || null;
+        if (nextStep) {
+          setActiveStep(nextStep);
+        }
+      }
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -208,9 +221,14 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                 disabled={uploading}
                 onChange={(event) => handleUpload(event, activeStep)}
               />
-              <div className="thumb-list" style={{ marginTop: '1rem' }}>
+                <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img
+                    key={asset.id}
+                    src={asset.preview_url ? `${API_BASE}${asset.preview_url}` : asset.file_url}
+                    className="thumb"
+                    alt={activeStep.title}
+                  />
                 ))}
               </div>
             </div>
