@@ -33,6 +33,7 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
     status session_status NOT NULL DEFAULT 'draft',
     expires_at TIMESTAMPTZ NOT NULL,
     seller_name VARCHAR(128),
+    seller_email VARCHAR(128),
     seller_phone VARCHAR(32),
     listing_id VARCHAR(64),
     vin VARCHAR(32),
@@ -51,6 +52,8 @@ CREATE TABLE IF NOT EXISTS session_assets (
     session_id INTEGER NOT NULL REFERENCES capture_sessions(id) ON DELETE CASCADE,
     step_key VARCHAR(64) NOT NULL,
     file_url TEXT NOT NULL,
+    preview_url TEXT,
+    s3_key TEXT,
     thumb_url TEXT,
     mime_type VARCHAR(64) NOT NULL,
     width INTEGER NOT NULL,
@@ -70,3 +73,7 @@ CREATE TABLE IF NOT EXISTS session_reviews (
     reviewer_id INTEGER REFERENCES users(id),
     updated_at TIMESTAMPTZ DEFAULT NOW()
 );
+
+ALTER TABLE capture_sessions ADD COLUMN IF NOT EXISTS seller_email VARCHAR(128);
+ALTER TABLE session_assets ADD COLUMN IF NOT EXISTS s3_key TEXT;
+ALTER TABLE session_assets ADD COLUMN IF NOT EXISTS preview_url TEXT;

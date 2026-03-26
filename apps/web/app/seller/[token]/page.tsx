@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -38,11 +39,14 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const [reviews, setReviews] = useState<Review[]>([]);
   const [sessionStatus, setSessionStatus] = useState<string>('draft');
   const [missingRequired, setMissingRequired] = useState<number>(0);
-  const [activeStep, setActiveStep] = useState<Step | null>(null);
+  const [activeStepKey, setActiveStepKey] = useState<string | null>(null);
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
   const [notice, setNotice] = useState<string>('');
   const [agreeDocs, setAgreeDocs] = useState<boolean>(false);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
+
+  const flatSteps = useMemo(() => groups.flatMap((group) => group.steps), [groups]);
 
   useEffect(() => {
     const load = async () => {
@@ -55,6 +59,8 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
       setMissingRequired(sessionData.missing_required || 0);
+      const firstStep = stepsData.flatMap((group: StepGroup) => group.steps)[0];
+      setActiveStepKey(firstStep?.stepKey || null);
       setLoading(false);
     };
     load();
@@ -80,16 +86,20 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   }, [reviews]);
 
   const requiredSteps = useMemo(() => {
-    return groups.flatMap((group) => group.steps.filter((step) => step.required));
-  }, [groups]);
+    return flatSteps.filter((step) => step.required);
+  }, [flatSteps]);
 
   const completedRequired = useMemo(() => {
-    return requiredSteps.filter((step) => (assetMap[step.stepKey] || []).length >= step.minCount)
-      .length;
+    return requiredSteps.filter((step) => (assetMap[step.stepKey] || []).length >= step.minCount).length;
   }, [requiredSteps, assetMap]);
 
   const totalRequired = requiredSteps.length;
   const progress = totalRequired ? Math.round((completedRequired / totalRequired) * 100) : 0;
+
+  const activeStepIndex = useMemo(() => flatSteps.findIndex((step) => step.stepKey === activeStepKey), [flatSteps, activeStepKey]);
+  const activeStep = activeStepIndex >= 0 ? flatSteps[activeStepIndex] : null;
+  const previousStep = activeStepIndex > 0 ? flatSteps[activeStepIndex - 1] : null;
+  const nextStep = activeStepIndex >= 0 && activeStepIndex < flatSteps.length - 1 ? flatSteps[activeStepIndex + 1] : null;
 
   const handleUpload = async (event: React.ChangeEvent<HTMLInputElement>, step: Step) => {
     if (!event.target.files || event.target.files.length === 0) return;
@@ -97,28 +107,30 @@ export default function SellerCapturePage({ params }: { params: { token: string 
     setNotice('');
     try {
       const file = event.target.files[0];
-      const presignResp = await fetch(`${API_BASE}/api/sessions/${token}/presign`, {
+      const formData = new FormData();
+      formData.append('step_key', step.stepKey);
+      formData.append('file', file);
+      const uploadResp = await fetch(`${API_BASE}/api/sessions/${token}/assets`, {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name, mime_type: file.type })
+        body: formData
       });
-      const presignData = await presignResp.json();
-      await fetch(presignData.uploadUrl, {
-        method: 'PUT',
-        headers: { 'Content-Type': file.type },
-        body: file
-      });
-      const confirmResp = await fetch(`${API_BASE}/api/sessions/${token}/assets`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ step_key: step.stepKey, s3_key: presignData.s3Key, mime_type: file.type })
-      });
-      if (!confirmResp.ok) {
-        const error = await confirmResp.json();
+      if (!uploadResp.ok) {
+        const error = await uploadResp.json();
         throw new Error(error.detail || 'Upload failed');
       }
-      const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      const uploadData = await uploadResp.json();
+      setAssets((prev) => [
+        ...prev,
+        {
+          id: uploadData.id,
+          step_key: uploadData.step_key,
+          file_url: uploadData.fileUrl,
+          preview_url: uploadData.preview_url
+        }
+      ]);
+      if (uploadData.next_step_key) {
+        setActiveStepKey(uploadData.next_step_key);
+      }
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -161,63 +173,85 @@ export default function SellerCapturePage({ params }: { params: { token: string 
         )}
       </div>
 
-      <div className="grid two" style={{ marginTop: '1.5rem' }}>
-        <div className="card">
-          <h2>Steps</h2>
-          <div className="step-list">
-            {groups.map((group) => (
-              <div key={group.group}>
-                <h3>{group.group}</h3>
-                <div className="step-list">
-                  {group.steps.map((step) => {
-                    const count = (assetMap[step.stepKey] || []).length;
-                    const review = reviewMap[step.stepKey];
-                    return (
-                      <button
-                        key={step.stepKey}
-                        className="button secondary"
-                        type="button"
-                        onClick={() => setActiveStep(step)}
-                      >
-                        {step.title} ({count}/{step.minCount})
-                        {review?.decision === 'retake' ? ' • Retake' : ''}
-                      </button>
-                    );
-                  })}
-                </div>
+      <div className="card" style={{ marginTop: '1.5rem' }}>
+        {activeStep ? (
+          <div>
+            <p className="tag">Step {activeStepIndex + 1} of {flatSteps.length}</p>
+            <h2>{activeStep.title}</h2>
+            <p>{activeStep.description}</p>
+            <p>Example hint: {activeStep.example}</p>
+            {reviewMap[activeStep.stepKey]?.decision === 'retake' && (
+              <div className="alert">
+                Retake requested: {reviewMap[activeStep.stepKey]?.comment || 'Please reshoot this step.'}
               </div>
-            ))}
-          </div>
-        </div>
+            )}
+            <p>Required: {activeStep.required ? 'Yes' : 'Optional'} • Min {activeStep.minCount}</p>
 
-        <div className="card">
-          {activeStep ? (
-            <div>
-              <h2>{activeStep.title}</h2>
-              <p>{activeStep.description}</p>
-              {reviewMap[activeStep.stepKey]?.decision === 'retake' && (
-                <div className="alert">
-                  Retake requested: {reviewMap[activeStep.stepKey]?.comment || 'Please reshoot this step.'}
-                </div>
-              )}
-              <p>Required: {activeStep.required ? 'Yes' : 'Optional'} • Min {activeStep.minCount}</p>
-              <input
-                type="file"
-                accept={activeStep.mode === 'doc' ? 'image/*,application/pdf' : 'image/*'}
-                capture="environment"
-                disabled={uploading}
-                onChange={(event) => handleUpload(event, activeStep)}
-              />
-              <div className="thumb-list" style={{ marginTop: '1rem' }}>
-                {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
-                ))}
-              </div>
+            <input
+              ref={fileInputRef}
+              type="file"
+              accept="image/*"
+              capture="environment"
+              disabled={uploading}
+              onChange={(event) => handleUpload(event, activeStep)}
+              style={{ display: 'none' }}
+            />
+
+            <button
+              className="button"
+              type="button"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+            >
+              {(assetMap[activeStep.stepKey] || []).length > 0 ? 'Retake photo' : 'Take photo'}
+            </button>
+
+            {!activeStep.required && (
+              <button
+                className="button secondary"
+                type="button"
+                style={{ marginLeft: '0.5rem' }}
+                onClick={() => nextStep && setActiveStepKey(nextStep.stepKey)}
+                disabled={!nextStep}
+              >
+                Skip for now
+              </button>
+            )}
+
+            <div className="thumb-list" style={{ marginTop: '1rem' }}>
+              {(assetMap[activeStep.stepKey] || []).map((asset) => (
+                <img
+                  key={asset.id}
+                  src={`${API_BASE}${asset.preview_url || ''}`}
+                  className="thumb"
+                  alt={activeStep.title}
+                />
+              ))}
             </div>
-          ) : (
-            <p>Select a step to begin capturing.</p>
-          )}
-        </div>
+
+            <div style={{ marginTop: '1rem' }}>
+              <button
+                className="button secondary"
+                type="button"
+                onClick={() => previousStep && setActiveStepKey(previousStep.stepKey)}
+                disabled={!previousStep}
+              >
+                Back
+              </button>
+              <button
+                className="button"
+                type="button"
+                style={{ marginLeft: '0.5rem' }}
+                onClick={() => nextStep && setActiveStepKey(nextStep.stepKey)}
+                disabled={!nextStep}
+              >
+                Next
+              </button>
+            </div>
+          </div>
+        ) : (
+          <p>No steps available.</p>
+        )}
       </div>
 
       <div className="card" style={{ marginTop: '1.5rem' }}>
