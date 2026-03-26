@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
@@ -70,12 +70,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AssetConfirm(BaseModel):
-    step_key: str
-    s3_key: str
-    mime_type: str
-
-
 class ReviewDecision(BaseModel):
     step_key: str
     decision: str
@@ -84,11 +78,6 @@ class ReviewDecision(BaseModel):
 
 class SubmitRequest(BaseModel):
     agree_documents_redaction: bool = False
-
-
-class PresignRequest(BaseModel):
-    filename: str
-    mime_type: str
 
 
 class AdminSessionList(BaseModel):
@@ -113,7 +102,6 @@ def require_admin(authorization: str = Header(...)) -> Dict[str, Any]:
     except jwt.PyJWTError as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
     return payload
-
 
 
 @app.on_event("startup")
@@ -450,6 +438,28 @@ STEP_GROUPS = [
 ]
 
 
+STEP_LOOKUP = {
+    step["stepKey"]: step
+    for group in STEP_GROUPS
+    for step in group["steps"]
+}
+STEP_ORDER = [step["stepKey"] for group in STEP_GROUPS for step in group["steps"]]
+
+
+def next_step_key_for_session(db: Session, session_id: int) -> Optional[str]:
+    asset_rows = db.execute(select(session_assets.c.step_key).where(session_assets.c.session_id == session_id)).fetchall()
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+
+    for step_key in STEP_ORDER:
+        step = STEP_LOOKUP[step_key]
+        if counts.get(step_key, 0) < step["minCount"]:
+            return step_key
+    return None
+
+
 @app.get("/api/steps")
 def get_steps():
     return STEP_GROUPS
@@ -623,65 +633,62 @@ def get_session(token: str, db: Session = Depends(get_db)):
         "assets": [dict(row._mapping) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": next_step_key_for_session(db, session["id"]),
     }
 
 
-@app.post("/api/sessions/{token}/presign")
-def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
-    session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
-    )
-    return {"uploadUrl": url, "s3Key": key}
-
-
 @app.post("/api/sessions/{token}/assets")
-def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
+def upload_asset(
+    token: str,
+    step_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db)
+):
     session_id = get_session_id(db, token)
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
-    except s3_client.exceptions.NoSuchKey as exc:
-        raise HTTPException(status_code=404, detail="Upload not found") from exc
+    if step_key not in STEP_LOOKUP:
+        raise HTTPException(status_code=400, detail="Unknown step key")
 
-    data = obj["Body"].read()
+    mime_type = file.content_type or ""
+    if not mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    data = file.file.read()
     size_bytes = len(data)
     if size_bytes > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
 
     width = 0
     height = 0
-    if payload.mime_type.startswith("image/"):
-        try:
-            image = Image.open(BytesIO(data))
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            if width < 1600 and height < 1600:
-                raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
-            buffer = BytesIO()
-            image.save(buffer, format=image.format or "JPEG")
-            buffer.seek(0)
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=payload.s3_key,
-                Body=buffer,
-                ContentType=payload.mime_type,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            raise HTTPException(status_code=400, detail="Invalid image") from exc
+    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{file.filename or 'image'}"
+    try:
+        image = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+        if width < 1600 and height < 1600:
+            raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
+        buffer = BytesIO()
+        image.save(buffer, format=image.format or "JPEG")
+        buffer.seek(0)
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=key,
+            Body=buffer,
+            ContentType=mime_type,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
+    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{key}"
     result = db.execute(
         insert(session_assets)
         .values(
             session_id=session_id,
-            step_key=payload.step_key,
+            step_key=step_key,
             file_url=file_url,
-            mime_type=payload.mime_type,
+            thumb_url=file_url,
+            mime_type=mime_type,
             width=width,
             height=height,
             size_bytes=size_bytes,
@@ -690,7 +697,15 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "file_url": file_url,
+        "preview_url": file_url,
+        "width": width,
+        "height": height,
+        "size_bytes": size_bytes,
+        "next_step_key": next_step_key_for_session(db, session_id),
+    }
 
 
 @app.post("/api/sessions/{token}/submit")
