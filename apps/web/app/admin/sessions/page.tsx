@@ -14,6 +14,18 @@ interface SessionRow {
   missing_required: number;
 }
 
+interface NotificationPayload {
+  sms?: {
+    to?: string;
+    message?: string;
+  };
+  email?: {
+    to?: string;
+    subject?: string;
+    body?: string;
+  };
+}
+
 export default function AdminSessionsPage() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [notice, setNotice] = useState('');
@@ -29,6 +41,7 @@ export default function AdminSessionsPage() {
     vehicle_year: ''
   });
   const [link, setLink] = useState('');
+  const [notifications, setNotifications] = useState<NotificationPayload | null>(null);
 
   const loadSessions = async () => {
     const token = localStorage.getItem('carsoo_admin_token');
@@ -51,6 +64,7 @@ export default function AdminSessionsPage() {
   const createSession = async () => {
     setNotice('');
     setLink('');
+    setNotifications(null);
     const token = localStorage.getItem('carsoo_admin_token');
     if (!token) {
       setNotice('Please login again.');
@@ -67,6 +81,7 @@ export default function AdminSessionsPage() {
     }
     const data = await resp.json();
     setLink(data.link);
+    setNotifications(data.notifications || null);
     await loadSessions();
   };
 
@@ -79,6 +94,21 @@ export default function AdminSessionsPage() {
           {link && (
             <div className="alert">
               Seller link: <a href={link}>{link}</a>
+            </div>
+          )}
+          {notifications?.sms && (
+            <div className="card" style={{ marginTop: '1rem' }}>
+              <h3>SMS notification</h3>
+              <p><strong>To:</strong> {notifications.sms.to || '-'}</p>
+              <p><strong>Message:</strong> {notifications.sms.message || '-'}</p>
+            </div>
+          )}
+          {notifications?.email && (
+            <div className="card" style={{ marginTop: '1rem' }}>
+              <h3>Email notification</h3>
+              <p><strong>To:</strong> {notifications.email.to || '-'}</p>
+              <p><strong>Subject:</strong> {notifications.email.subject || '-'}</p>
+              <p><strong>Body:</strong> {notifications.email.body || '-'}</p>
             </div>
           )}
           <div className="grid two">
