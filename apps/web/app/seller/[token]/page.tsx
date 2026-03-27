@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { normalizePreviewUrl } from '../../../lib/preview-url';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -23,6 +24,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -209,9 +211,13 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                 onChange={(event) => handleUpload(event, activeStep)}
               />
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
-                {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
-                ))}
+                {(assetMap[activeStep.stepKey] || []).map((asset) => {
+                  const previewSrc = normalizePreviewUrl(asset.preview_url);
+                  if (!previewSrc) {
+                    return null;
+                  }
+                  return <img key={asset.id} src={previewSrc} className="thumb" alt={activeStep.title} />;
+                })}
               </div>
             </div>
           ) : (
