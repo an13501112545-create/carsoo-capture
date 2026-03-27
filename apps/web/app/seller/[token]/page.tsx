@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -210,7 +211,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
               />
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img key={asset.id} src={asset.preview_url ? `${API_BASE}${asset.preview_url}` : asset.file_url} className="thumb" alt={activeStep.title} />
                 ))}
               </div>
             </div>
