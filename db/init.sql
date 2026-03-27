@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
     expires_at TIMESTAMPTZ NOT NULL,
     seller_name VARCHAR(128),
     seller_phone VARCHAR(32),
+    seller_email VARCHAR(128),
     listing_id VARCHAR(64),
     vin VARCHAR(32),
     plate VARCHAR(32),
@@ -45,6 +46,9 @@ CREATE TABLE IF NOT EXISTS capture_sessions (
     updated_at TIMESTAMPTZ DEFAULT NOW(),
     submitted_at TIMESTAMPTZ
 );
+
+ALTER TABLE capture_sessions
+    ADD COLUMN IF NOT EXISTS seller_email VARCHAR(128);
 
 CREATE TABLE IF NOT EXISTS session_assets (
     id SERIAL PRIMARY KEY,
