@@ -20,6 +20,7 @@ export default function AdminSessionsPage() {
   const [form, setForm] = useState({
     seller_name: '',
     seller_phone: '',
+    seller_email: '',
     listing_id: '',
     vin: '',
     plate: '',
@@ -89,6 +90,10 @@ export default function AdminSessionsPage() {
             <label>
               Seller phone
               <input value={form.seller_phone} onChange={(e) => setForm({ ...form, seller_phone: e.target.value })} />
+            </label>
+            <label>
+              Seller email
+              <input value={form.seller_email} onChange={(e) => setForm({ ...form, seller_email: e.target.value })} />
             </label>
             <label>
               Listing ID
