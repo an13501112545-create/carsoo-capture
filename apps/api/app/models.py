@@ -35,6 +35,7 @@ capture_sessions = Table(
     Column("expires_at", DateTime(timezone=True), nullable=False),
     Column("seller_name", String(128)),
     Column("seller_phone", String(32)),
+    Column("seller_email", String(255)),
     Column("listing_id", String(64)),
     Column("vin", String(32)),
     Column("plate", String(32)),
