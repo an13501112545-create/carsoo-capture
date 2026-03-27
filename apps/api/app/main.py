@@ -9,6 +9,7 @@ from botocore.config import Config
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
 from sqlalchemy.orm import Session
@@ -503,11 +504,32 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+    link = f"{APP_BASE_URL}/seller/{token}"
+    sms_message = f"Car capture link: {link} (expires {expires_at.isoformat()})"
+    email_subject = "Your Carsoo capture link"
+    seller_email = getattr(payload, "seller_email", None) or "seller@example.com"
+    email_body = (
+        f"Hi {payload.seller_name or 'Seller'},\n\n"
+        f"Please complete your capture session here: {link}\n"
+        f"Session expires at: {expires_at.isoformat()}\n\n"
+        "Thanks,\nCarsoo Team"
+    )
     return {
         "id": session_id,
         "token": token,
-        "link": f"{APP_BASE_URL}/seller/{token}",
+        "link": link,
         "expires_at": expires_at,
+        "notifications": {
+            "sms": {
+                "to": payload.seller_phone,
+                "message": sms_message,
+            },
+            "email": {
+                "to": seller_email,
+                "subject": email_subject,
+                "body": email_body,
+            },
+        },
     }
 
 
@@ -540,7 +562,13 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [
+            {
+                **dict(row._mapping),
+                "preview_url": f"/api/admin/sessions/{session_id}/assets/{row._mapping['id']}/preview",
+            }
+            for row in assets
+        ],
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -620,10 +648,43 @@ def get_session(token: str, db: Session = Depends(get_db)):
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [
+            {
+                **dict(row._mapping),
+                "preview_url": f"/api/sessions/{token}/assets/{row._mapping['id']}/preview",
+            }
+            for row in assets
+        ],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
     }
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def preview_session_asset(token: str, asset_id: int, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    row = db.execute(
+        select(session_assets).where(
+            session_assets.c.id == asset_id,
+            session_assets.c.session_id == session_id,
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return stream_asset_from_storage(row._mapping["file_url"], row._mapping["mime_type"])
+
+
+@app.get("/api/admin/sessions/{session_id}/assets/{asset_id}/preview")
+def preview_admin_asset(asset_id: int, session_id: int, admin=Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.execute(
+        select(session_assets).where(
+            session_assets.c.id == asset_id,
+            session_assets.c.session_id == session_id,
+        )
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return stream_asset_from_storage(row._mapping["file_url"], row._mapping["mime_type"])
 
 
 @app.post("/api/sessions/{token}/presign")
@@ -741,6 +802,22 @@ def count_missing_required(db: Session, session_id: int) -> int:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
                     missing += 1
     return missing
+
+
+def storage_key_from_file_url(file_url: str) -> str:
+    prefix = f"{S3_ENDPOINT}/{S3_BUCKET}/"
+    if not file_url.startswith(prefix):
+        raise HTTPException(status_code=400, detail="Invalid asset URL")
+    return file_url[len(prefix):]
+
+
+def stream_asset_from_storage(file_url: str, mime_type: str):
+    key = storage_key_from_file_url(file_url)
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset not found in storage") from exc
+    return StreamingResponse(obj["Body"].iter_chunks(), media_type=mime_type)
 
 
 @app.get("/api/health")
