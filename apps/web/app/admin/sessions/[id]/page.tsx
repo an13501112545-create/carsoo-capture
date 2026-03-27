@@ -7,7 +7,7 @@ const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 interface Asset {
   id: number;
   step_key: string;
-  file_url: string;
+  preview_url: string;
 }
 
 interface ReviewDecision {
@@ -28,27 +28,25 @@ interface Step {
   description: string;
   required: boolean;
   minCount: number;
-}
-
-interface StepGroup {
   group: string;
-  steps: Step[];
 }
 
 export default function AdminReviewPage({ params }: { params: { id: string } }) {
   const [detail, setDetail] = useState<SessionDetail | null>(null);
-  const [groups, setGroups] = useState<StepGroup[]>([]);
+  const [steps, setSteps] = useState<Step[]>([]);
   const [notice, setNotice] = useState('');
 
   const load = async () => {
     const token = localStorage.getItem('carsoo_admin_token');
     if (!token) return;
-    const stepsResp = await fetch(`${API_BASE}/api/steps`);
+    const [stepsResp, resp] = await Promise.all([
+      fetch(`${API_BASE}/api/steps`),
+      fetch(`${API_BASE}/api/admin/sessions/${params.id}`, {
+        headers: { Authorization: `Bearer ${token}` }
+      })
+    ]);
     const stepsData = await stepsResp.json();
-    setGroups(stepsData);
-    const resp = await fetch(`${API_BASE}/api/admin/sessions/${params.id}`, {
-      headers: { Authorization: `Bearer ${token}` }
-    });
+    setSteps(stepsData || []);
     if (!resp.ok) {
       setNotice('Failed to load session');
       return;
@@ -64,9 +62,7 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
   const assetMap = useMemo(() => {
     const map: Record<string, Asset[]> = {};
     detail?.assets.forEach((asset) => {
-      if (!map[asset.step_key]) {
-        map[asset.step_key] = [];
-      }
+      if (!map[asset.step_key]) map[asset.step_key] = [];
       map[asset.step_key].push(asset);
     });
     return map;
@@ -79,6 +75,15 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
     });
     return map;
   }, [detail]);
+
+  const groupedSteps = useMemo(() => {
+    const groups: Record<string, Step[]> = {};
+    steps.forEach((step) => {
+      if (!groups[step.group]) groups[step.group] = [];
+      groups[step.group].push(step);
+    });
+    return groups;
+  }, [steps]);
 
   const updateReview = (stepKey: string, decision: string, comment?: string) => {
     if (!detail) return;
@@ -102,9 +107,7 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
     setNotice('Review saved.');
   };
 
-  if (!detail) {
-    return <main>Loading...</main>;
-  }
+  if (!detail) return <main>Loading...</main>;
 
   return (
     <main>
@@ -115,10 +118,10 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
         <button className="button" onClick={saveReview}>Save review</button>
       </div>
 
-      {groups.map((group) => (
-        <div key={group.group} className="card" style={{ marginTop: '1.5rem' }}>
-          <h2>{group.group}</h2>
-          {group.steps.map((step) => {
+      {Object.entries(groupedSteps).map(([groupName, groupSteps]) => (
+        <div key={groupName} className="card" style={{ marginTop: '1.5rem' }}>
+          <h2>{groupName}</h2>
+          {groupSteps.map((step) => {
             const assets = assetMap[step.stepKey] || [];
             const review = reviewState[step.stepKey];
             return (
@@ -126,7 +129,7 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
                 <h3>{step.title}</h3>
                 <div className="thumb-list">
                   {assets.map((asset) => (
-                    <img key={asset.id} className="thumb" src={asset.file_url} alt={step.title} />
+                    <img key={asset.id} className="thumb" src={`${API_BASE}${asset.preview_url}`} alt={step.title} />
                   ))}
                 </div>
                 <div className="grid two" style={{ marginTop: '0.5rem' }}>

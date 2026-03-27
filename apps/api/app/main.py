@@ -2,19 +2,20 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from io import BytesIO
 from typing import Any, Dict, List, Optional
 
 import boto3
-from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from botocore.config import Config
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy import select, insert, update, delete
-from sqlalchemy.orm import Session
+from fastapi.responses import StreamingResponse
 from passlib.context import CryptContext
 from PIL import Image, ImageOps
-from io import BytesIO
+from pydantic import BaseModel
+from sqlalchemy import delete, insert, select, update
+from sqlalchemy.orm import Session
 
 from .db import get_db
 from .models import capture_sessions, session_assets, session_reviews, users
@@ -49,13 +50,28 @@ app.add_middleware(
     allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"]
+    allow_headers=["*"],
 )
+
+
+CORE_REQUIRED_STEP_KEYS = [
+    "odometer_closeup",
+    "vin_windshield",
+    "plate_front_or_rear",
+    "keys_photo",
+    "ext_front",
+    "ext_rear",
+    "ext_left_side",
+    "ext_right_side",
+    "int_dashboard_wide",
+    "engine_bay_wide",
+]
 
 
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -70,12 +86,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AssetConfirm(BaseModel):
-    step_key: str
-    s3_key: str
-    mime_type: str
-
-
 class ReviewDecision(BaseModel):
     step_key: str
     decision: str
@@ -84,11 +94,6 @@ class ReviewDecision(BaseModel):
 
 class SubmitRequest(BaseModel):
     agree_documents_redaction: bool = False
-
-
-class PresignRequest(BaseModel):
-    filename: str
-    mime_type: str
 
 
 class AdminSessionList(BaseModel):
@@ -115,7 +120,6 @@ def require_admin(authorization: str = Header(...)) -> Dict[str, Any]:
     return payload
 
 
-
 @app.on_event("startup")
 def startup_tasks():
     try:
@@ -124,335 +128,47 @@ def startup_tasks():
         s3_client.create_bucket(Bucket=S3_BUCKET)
 
 
-STEP_GROUPS = [
-    {
-        "group": "Vehicle Identity",
-        "steps": [
-            {
-                "stepKey": "odometer_closeup",
-                "title": "Odometer close-up",
-                "description": "Capture the illuminated odometer clearly.",
-                "example": "/examples/odometer.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "vin_windshield",
-                "title": "VIN windshield",
-                "description": "Photograph the VIN plate through the windshield.",
-                "example": "/examples/vin_windshield.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "vin_door_jamb",
-                "title": "VIN door jamb",
-                "description": "Photograph the VIN label on the door jamb.",
-                "example": "/examples/vin_door.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "plate_front_or_rear",
-                "title": "License plate",
-                "description": "Photograph the rear license plate clearly.",
-                "example": "/examples/plate.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "keys_photo",
-                "title": "Keys",
-                "description": "Photograph the key fob and spare keys if any.",
-                "example": "/examples/keys.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-        ],
-    },
-    {
-        "group": "Exterior",
-        "steps": [
-            {
-                "stepKey": "ext_front",
-                "title": "Front",
-                "description": "Front view of the vehicle.",
-                "example": "/examples/ext_front.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_front_left_45",
-                "title": "Front left 45°",
-                "description": "Front-left 45 degree angle.",
-                "example": "/examples/ext_front_left.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_front_right_45",
-                "title": "Front right 45°",
-                "description": "Front-right 45 degree angle.",
-                "example": "/examples/ext_front_right.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_rear",
-                "title": "Rear",
-                "description": "Rear view of the vehicle.",
-                "example": "/examples/ext_rear.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_rear_left_45",
-                "title": "Rear left 45°",
-                "description": "Rear-left 45 degree angle.",
-                "example": "/examples/ext_rear_left.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_rear_right_45",
-                "title": "Rear right 45°",
-                "description": "Rear-right 45 degree angle.",
-                "example": "/examples/ext_rear_right.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_left_side",
-                "title": "Left side",
-                "description": "Driver-side profile.",
-                "example": "/examples/ext_left.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_right_side",
-                "title": "Right side",
-                "description": "Passenger-side profile.",
-                "example": "/examples/ext_right.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_roof_optional",
-                "title": "Roof (optional)",
-                "description": "Roof condition if accessible.",
-                "example": "/examples/ext_roof.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "ext_undercarriage_optional",
-                "title": "Undercarriage (optional)",
-                "description": "Undercarriage if possible.",
-                "example": "/examples/ext_undercarriage.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "photo",
-            },
-        ],
-    },
-    {
-        "group": "Interior",
-        "steps": [
-            {
-                "stepKey": "int_dashboard_wide",
-                "title": "Dashboard wide",
-                "description": "Dashboard, steering wheel, and gauges.",
-                "example": "/examples/int_dashboard.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_center_console",
-                "title": "Center console",
-                "description": "Center console and shifter.",
-                "example": "/examples/int_console.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_infotainment_on",
-                "title": "Infotainment on",
-                "description": "Power on the infotainment screen.",
-                "example": "/examples/int_infotainment.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_front_seats",
-                "title": "Front seats",
-                "description": "Front seats and cabin.",
-                "example": "/examples/int_front_seats.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_rear_seats",
-                "title": "Rear seats",
-                "description": "Rear seating area.",
-                "example": "/examples/int_rear_seats.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_driver_door_panel",
-                "title": "Driver door panel",
-                "description": "Driver door panel and controls.",
-                "example": "/examples/int_door.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_headliner_sunroof_optional",
-                "title": "Headliner / Sunroof (optional)",
-                "description": "Headliner or sunroof condition.",
-                "example": "/examples/int_headliner.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_trunk_open",
-                "title": "Trunk open",
-                "description": "Open trunk view.",
-                "example": "/examples/int_trunk.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "int_trunk_floor_spare_optional",
-                "title": "Trunk floor/spare (optional)",
-                "description": "Trunk floor or spare tire.",
-                "example": "/examples/int_spare.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "photo",
-            },
-        ],
-    },
-    {
-        "group": "Mechanical & Tires",
-        "steps": [
-            {
-                "stepKey": "engine_bay_wide",
-                "title": "Engine bay",
-                "description": "Wide shot of the engine bay.",
-                "example": "/examples/engine.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "tire_front_left_tread",
-                "title": "Front left tire tread",
-                "description": "Tread depth close-up.",
-                "example": "/examples/tire_fl.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "tire_front_right_tread",
-                "title": "Front right tire tread",
-                "description": "Tread depth close-up.",
-                "example": "/examples/tire_fr.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "tire_rear_left_tread",
-                "title": "Rear left tire tread",
-                "description": "Tread depth close-up.",
-                "example": "/examples/tire_rl.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "tire_rear_right_tread",
-                "title": "Rear right tire tread",
-                "description": "Tread depth close-up.",
-                "example": "/examples/tire_rr.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-            {
-                "stepKey": "wheels_rims_any_damage",
-                "title": "Wheel/rim damage",
-                "description": "Close-ups of any rim damage.",
-                "example": "/examples/rim.jpg",
-                "required": True,
-                "minCount": 1,
-                "mode": "photo",
-            },
-        ],
-    },
-    {
-        "group": "Documents",
-        "steps": [
-            {
-                "stepKey": "ownership_front",
-                "title": "Ownership front",
-                "description": "Redact address/ID numbers before upload.",
-                "example": "/examples/ownership_front.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "doc",
-            },
-            {
-                "stepKey": "ownership_back",
-                "title": "Ownership back",
-                "description": "Redact address/ID numbers before upload.",
-                "example": "/examples/ownership_back.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "doc",
-            },
-            {
-                "stepKey": "service_records_optional",
-                "title": "Service records",
-                "description": "Upload service history photos or PDFs.",
-                "example": "/examples/service_records.jpg",
-                "required": False,
-                "minCount": 1,
-                "mode": "doc",
-            },
-        ],
-    },
+STEPS = [
+    {"stepKey": "odometer_closeup", "title": "Odometer close-up", "description": "Capture the illuminated odometer clearly.", "example": "/examples/odometer.jpg", "group": "Vehicle Identity"},
+    {"stepKey": "vin_windshield", "title": "VIN windshield", "description": "Photograph the VIN plate through the windshield.", "example": "/examples/vin_windshield.jpg", "group": "Vehicle Identity"},
+    {"stepKey": "vin_door_jamb", "title": "VIN door jamb", "description": "Photograph the VIN label on the door jamb.", "example": "/examples/vin_door.jpg", "group": "Vehicle Identity"},
+    {"stepKey": "plate_front_or_rear", "title": "License plate", "description": "Photograph the rear license plate clearly.", "example": "/examples/plate.jpg", "group": "Vehicle Identity"},
+    {"stepKey": "keys_photo", "title": "Keys", "description": "Photograph the key fob and spare keys if any.", "example": "/examples/keys.jpg", "group": "Vehicle Identity"},
+    {"stepKey": "ext_front", "title": "Front", "description": "Front view of the vehicle.", "example": "/examples/ext_front.jpg", "group": "Exterior"},
+    {"stepKey": "ext_rear", "title": "Rear", "description": "Rear view of the vehicle.", "example": "/examples/ext_rear.jpg", "group": "Exterior"},
+    {"stepKey": "ext_left_side", "title": "Left side", "description": "Driver-side profile.", "example": "/examples/ext_left.jpg", "group": "Exterior"},
+    {"stepKey": "ext_right_side", "title": "Right side", "description": "Passenger-side profile.", "example": "/examples/ext_right.jpg", "group": "Exterior"},
+    {"stepKey": "int_dashboard_wide", "title": "Dashboard wide", "description": "Dashboard, steering wheel, and gauges.", "example": "/examples/int_dashboard.jpg", "group": "Interior"},
+    {"stepKey": "engine_bay_wide", "title": "Engine bay", "description": "Wide shot of the engine bay.", "example": "/examples/engine.jpg", "group": "Mechanical"},
+    {"stepKey": "int_center_console", "title": "Center console", "description": "Center console and shifter.", "example": "/examples/int_console.jpg", "group": "Interior"},
+    {"stepKey": "int_front_seats", "title": "Front seats", "description": "Front seats and cabin.", "example": "/examples/int_front_seats.jpg", "group": "Interior"},
+    {"stepKey": "int_rear_seats", "title": "Rear seats", "description": "Rear seating area.", "example": "/examples/int_rear_seats.jpg", "group": "Interior"},
+    {"stepKey": "ownership_front", "title": "Ownership front", "description": "Redact address/ID numbers before upload.", "example": "/examples/ownership_front.jpg", "group": "Documents"},
 ]
+
+
+def normalized_steps() -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    for step in STEPS:
+        step_key = step["stepKey"]
+        normalized.append(
+            {
+                **step,
+                "required": step_key in CORE_REQUIRED_STEP_KEYS,
+                "minCount": 1,
+                "mode": "photo",
+            }
+        )
+    return normalized
+
+
+def get_step_map() -> Dict[str, Dict[str, Any]]:
+    return {step["stepKey"]: step for step in normalized_steps()}
 
 
 @app.get("/api/steps")
 def get_steps():
-    return STEP_GROUPS
+    return normalized_steps()
 
 
 @app.post("/api/admin/seed")
@@ -491,6 +207,7 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
             expires_at=expires_at,
             seller_name=payload.seller_name,
             seller_phone=payload.seller_phone,
+            seller_email=payload.seller_email,
             listing_id=payload.listing_id,
             vin=payload.vin,
             plate=payload.plate,
@@ -503,32 +220,43 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+
+    notifications: Dict[str, Any] = {}
+    if payload.seller_phone:
+        notifications["sms"] = {
+            "to": payload.seller_phone,
+            "message": f"Please capture your vehicle photos: {APP_BASE_URL}/seller/{token}",
+        }
+    if payload.seller_email:
+        notifications["email"] = {
+            "to": payload.seller_email,
+            "subject": "Your vehicle photo capture link",
+            "body": f"Open this secure link to upload photos: {APP_BASE_URL}/seller/{token}",
+        }
+
     return {
         "id": session_id,
         "token": token,
         "link": f"{APP_BASE_URL}/seller/{token}",
         "expires_at": expires_at,
+        "notifications": notifications,
     }
 
 
 @app.get("/api/admin/sessions", response_model=List[AdminSessionList])
 def list_sessions(admin=Depends(require_admin), db: Session = Depends(get_db)):
     sessions = db.execute(select(capture_sessions)).fetchall()
-    results = []
-    for row in sessions:
-        session = row._mapping
-        missing_required = count_missing_required(db, session["id"])
-        results.append(
-            AdminSessionList(
-                id=session["id"],
-                status=session["status"],
-                vin=session["vin"],
-                plate=session["plate"],
-                created_at=session["created_at"],
-                missing_required=missing_required,
-            )
+    return [
+        AdminSessionList(
+            id=row._mapping["id"],
+            status=row._mapping["status"],
+            vin=row._mapping["vin"],
+            plate=row._mapping["plate"],
+            created_at=row._mapping["created_at"],
+            missing_required=count_missing_required(db, row._mapping["id"]),
         )
-    return results
+        for row in sessions
+    ]
 
 
 @app.get("/api/admin/sessions/{session_id}")
@@ -540,9 +268,18 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [serialize_asset(row._mapping, preview_path=f"/api/admin/assets/{row._mapping['id']}/preview") for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
     }
+
+
+@app.get("/api/admin/assets/{asset_id}/preview")
+def preview_admin_asset(asset_id: int, admin=Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = row._mapping
+    return stream_asset_from_storage(asset)
 
 
 @app.post("/api/admin/sessions/{session_id}/review")
@@ -579,7 +316,7 @@ def export_session(session_id: int, admin=Depends(require_admin), db: Session = 
         asset = row._mapping
         assets_payload.setdefault(asset["step_key"], []).append(
             {
-                "url": asset["file_url"],
+                "url": f"/api/admin/assets/{asset['id']}/preview",
                 "width": asset["width"],
                 "height": asset["height"],
                 "sizeBytes": asset["size_bytes"],
@@ -620,82 +357,101 @@ def get_session(token: str, db: Session = Depends(get_db)):
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [
+            serialize_asset(
+                row._mapping,
+                preview_path=f"/api/sessions/{token}/assets/{row._mapping['id']}/preview",
+            )
+            for row in assets
+        ],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": find_next_step_key(db, session["id"]),
     }
 
 
-@app.post("/api/sessions/{token}/presign")
-def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def preview_seller_asset(token: str, asset_id: int, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
-    )
-    return {"uploadUrl": url, "s3Key": key}
+    row = db.execute(
+        select(session_assets).where(session_assets.c.id == asset_id, session_assets.c.session_id == session_id)
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = row._mapping
+    return stream_asset_from_storage(asset)
 
 
 @app.post("/api/sessions/{token}/assets")
-def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
+def upload_asset(
+    token: str,
+    step_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     session_id = get_session_id(db, token)
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
-    except s3_client.exceptions.NoSuchKey as exc:
-        raise HTTPException(status_code=404, detail="Upload not found") from exc
+    step_map = get_step_map()
+    if step_key not in step_map:
+        raise HTTPException(status_code=400, detail="Invalid step")
 
-    data = obj["Body"].read()
+    mime_type = file.content_type or ""
+    if not mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
+
+    data = file.file.read()
     size_bytes = len(data)
+    if size_bytes == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
     if size_bytes > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
 
-    width = 0
-    height = 0
-    if payload.mime_type.startswith("image/"):
-        try:
-            image = Image.open(BytesIO(data))
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            if width < 1600 and height < 1600:
-                raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
-            buffer = BytesIO()
-            image.save(buffer, format=image.format or "JPEG")
-            buffer.seek(0)
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=payload.s3_key,
-                Body=buffer,
-                ContentType=payload.mime_type,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            raise HTTPException(status_code=400, detail="Invalid image") from exc
+    try:
+        image = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+        if width < 1600 and height < 1600:
+            raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
+        output_buffer = BytesIO()
+        image.save(output_buffer, format=image.format or "JPEG")
+        output_buffer.seek(0)
+        normalized_bytes = output_buffer.read()
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
+    object_key = f"sessions/{session_id}/{secrets.token_hex(8)}-{file.filename or 'upload.jpg'}"
+    s3_client.put_object(Bucket=S3_BUCKET, Key=object_key, Body=normalized_bytes, ContentType=mime_type)
+
+    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{object_key}"
     result = db.execute(
         insert(session_assets)
         .values(
             session_id=session_id,
-            step_key=payload.step_key,
+            step_key=step_key,
             file_url=file_url,
-            mime_type=payload.mime_type,
+            mime_type=mime_type,
             width=width,
             height=height,
-            size_bytes=size_bytes,
+            size_bytes=len(normalized_bytes),
         )
         .returning(session_assets.c.id)
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+
+    row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    return serialize_asset(
+        row._mapping,
+        preview_path=f"/api/sessions/{token}/assets/{asset_id}/preview",
+    )
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if payload.agree_documents_redaction is not True:
+        raise HTTPException(status_code=400, detail="You must confirm document redaction before submitting")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
@@ -728,19 +484,50 @@ def get_session_id(db: Session, token: str) -> int:
     return session["id"]
 
 
-def count_missing_required(db: Session, session_id: int) -> int:
+def count_assets_by_step(db: Session, session_id: int) -> Dict[str, int]:
     asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     counts: Dict[str, int] = {}
     for row in asset_rows:
-        step_key = row._mapping["step_key"]
-        counts[step_key] = counts.get(step_key, 0) + 1
-    missing = 0
-    for group in STEP_GROUPS:
-        for step in group["steps"]:
-            if step["required"]:
-                if counts.get(step["stepKey"], 0) < step["minCount"]:
-                    missing += 1
-    return missing
+        key = row._mapping["step_key"]
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def count_missing_required(db: Session, session_id: int) -> int:
+    counts = count_assets_by_step(db, session_id)
+    steps = normalized_steps()
+    return sum(1 for step in steps if step["required"] and counts.get(step["stepKey"], 0) < step["minCount"])
+
+
+def find_next_step_key(db: Session, session_id: int) -> Optional[str]:
+    counts = count_assets_by_step(db, session_id)
+    steps = normalized_steps()
+    for step in steps:
+        if step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    for step in steps:
+        if counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    return None
+
+
+def extract_object_key(file_url: str) -> str:
+    prefix = f"{S3_ENDPOINT}/{S3_BUCKET}/"
+    if not file_url.startswith(prefix):
+        raise HTTPException(status_code=500, detail="Invalid storage URL")
+    return file_url[len(prefix):]
+
+
+def stream_asset_from_storage(asset: Dict[str, Any]) -> StreamingResponse:
+    object_key = extract_object_key(asset["file_url"])
+    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=object_key)
+    return StreamingResponse(obj["Body"], media_type=asset.get("mime_type") or "application/octet-stream")
+
+
+def serialize_asset(asset: Dict[str, Any], preview_path: str) -> Dict[str, Any]:
+    payload = dict(asset)
+    payload["preview_url"] = preview_path
+    return payload
 
 
 @app.get("/api/health")
