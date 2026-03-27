@@ -1,13 +1,14 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { resolvePreviewUrl } from '../../../lib/preview-url';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
 interface Asset {
   id: number;
   step_key: string;
-  file_url: string;
+  preview_url?: string;
 }
 
 interface ReviewDecision {
@@ -125,9 +126,11 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
               <div key={step.stepKey} style={{ marginBottom: '1rem' }}>
                 <h3>{step.title}</h3>
                 <div className="thumb-list">
-                  {assets.map((asset) => (
-                    <img key={asset.id} className="thumb" src={asset.file_url} alt={step.title} />
-                  ))}
+                  {assets.map((asset) => {
+                    const src = resolvePreviewUrl(asset.preview_url);
+                    if (!src) return null;
+                    return <img key={asset.id} className="thumb" src={src} alt={step.title} />;
+                  })}
                 </div>
                 <div className="grid two" style={{ marginTop: '0.5rem' }}>
                   <select
