@@ -2,12 +2,14 @@ import hashlib
 import os
 import secrets
 from datetime import datetime, timedelta, timezone
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 
 import boto3
 from botocore.config import Config
 import jwt
 from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi.responses import StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
@@ -56,6 +58,7 @@ app.add_middleware(
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -491,6 +494,7 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
             expires_at=expires_at,
             seller_name=payload.seller_name,
             seller_phone=payload.seller_phone,
+            seller_email=payload.seller_email,
             listing_id=payload.listing_id,
             vin=payload.vin,
             plate=payload.plate,
@@ -503,11 +507,25 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
     )
     session_id = result.scalar_one()
     db.commit()
+    link = f"{APP_BASE_URL}/seller/{token}"
+    notifications: Dict[str, Dict[str, str]] = {}
+    if payload.seller_phone:
+        notifications["sms"] = {
+            "to": payload.seller_phone,
+            "message": f"Hi! Please complete your vehicle photo capture here: {link}",
+        }
+    if payload.seller_email:
+        notifications["email"] = {
+            "to": payload.seller_email,
+            "subject": "Complete your vehicle capture session",
+            "body": f"Hello,\n\nPlease use this secure link to complete your capture session:\n{link}\n\nThank you.",
+        }
     return {
         "id": session_id,
         "token": token,
-        "link": f"{APP_BASE_URL}/seller/{token}",
+        "link": link,
         "expires_at": expires_at,
+        "notifications": notifications,
     }
 
 
@@ -538,9 +556,14 @@ def get_session_admin(session_id: int, admin=Depends(require_admin), db: Session
         raise HTTPException(status_code=404, detail="Session not found")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session_id)).fetchall()
+    assets_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["preview_url"] = f"/api/admin/assets/{asset['id']}/preview"
+        assets_payload.append(asset)
     return {
         "session": dict(session_row._mapping),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": assets_payload,
         "reviews": [dict(row._mapping) for row in reviews],
     }
 
@@ -618,12 +641,54 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    assets_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["preview_url"] = f"/api/sessions/{token}/assets/{asset['id']}/preview"
+        assets_payload.append(asset)
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": assets_payload,
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
     }
+
+
+def _extract_s3_key(file_url: str) -> str:
+    parsed = urlparse(file_url)
+    path = parsed.path.lstrip("/")
+    bucket_prefix = f"{S3_BUCKET}/"
+    if path.startswith(bucket_prefix):
+        return path[len(bucket_prefix):]
+    return path
+
+
+def _stream_asset_file(asset: Dict[str, Any]) -> StreamingResponse:
+    s3_key = _extract_s3_key(asset["file_url"])
+    try:
+        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=s3_key)
+    except s3_client.exceptions.NoSuchKey as exc:
+        raise HTTPException(status_code=404, detail="Asset file not found") from exc
+    return StreamingResponse(obj["Body"].iter_chunks(chunk_size=64 * 1024), media_type=asset["mime_type"])
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def asset_preview(token: str, asset_id: int, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    row = db.execute(
+        select(session_assets).where(session_assets.c.id == asset_id, session_assets.c.session_id == session_id)
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return _stream_asset_file(dict(row._mapping))
+
+
+@app.get("/api/admin/assets/{asset_id}/preview")
+def asset_preview_admin(asset_id: int, admin=Depends(require_admin), db: Session = Depends(get_db)):
+    row = db.execute(select(session_assets).where(session_assets.c.id == asset_id)).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    return _stream_asset_file(dict(row._mapping))
 
 
 @app.post("/api/sessions/{token}/presign")
@@ -690,7 +755,14 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "previewUrl": f"/api/sessions/{token}/assets/{asset_id}/preview",
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+    }
 
 
 @app.post("/api/sessions/{token}/submit")

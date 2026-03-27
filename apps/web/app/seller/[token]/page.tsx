@@ -23,6 +23,7 @@ interface Asset {
   id: number;
   step_key: string;
   file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -118,7 +119,15 @@ export default function SellerCapturePage({ params }: { params: { token: string 
         throw new Error(error.detail || 'Upload failed');
       }
       const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      setAssets((prev) => [
+        ...prev,
+        {
+          id: confirmData.id,
+          step_key: step.stepKey,
+          file_url: confirmData.fileUrl,
+          preview_url: confirmData.previewUrl || `${API_BASE}/api/sessions/${token}/assets/${confirmData.id}/preview`
+        }
+      ]);
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -210,7 +219,12 @@ export default function SellerCapturePage({ params }: { params: { token: string 
               />
               <div className="thumb-list" style={{ marginTop: '1rem' }}>
                 {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
+                  <img
+                    key={asset.id}
+                    src={asset.preview_url ? `${API_BASE}${asset.preview_url}` : asset.file_url}
+                    className="thumb"
+                    alt={activeStep.title}
+                  />
                 ))}
               </div>
             </div>
