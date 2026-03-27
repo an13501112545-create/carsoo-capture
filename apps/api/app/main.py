@@ -7,8 +7,9 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
 from sqlalchemy.orm import Session
@@ -56,6 +57,7 @@ app.add_middleware(
 class SessionCreate(BaseModel):
     seller_name: Optional[str] = None
     seller_phone: Optional[str] = None
+    seller_email: Optional[str] = None
     listing_id: Optional[str] = None
     vin: Optional[str] = None
     plate: Optional[str] = None
@@ -70,12 +72,6 @@ class LoginRequest(BaseModel):
     password: str
 
 
-class AssetConfirm(BaseModel):
-    step_key: str
-    s3_key: str
-    mime_type: str
-
-
 class ReviewDecision(BaseModel):
     step_key: str
     decision: str
@@ -84,11 +80,6 @@ class ReviewDecision(BaseModel):
 
 class SubmitRequest(BaseModel):
     agree_documents_redaction: bool = False
-
-
-class PresignRequest(BaseModel):
-    filename: str
-    mime_type: str
 
 
 class AdminSessionList(BaseModel):
@@ -449,10 +440,35 @@ STEP_GROUPS = [
     },
 ]
 
+CORE_REQUIRED_STEP_KEYS = {
+    "odometer_closeup",
+    "vin_windshield",
+    "plate_front_or_rear",
+    "keys_photo",
+    "ext_front",
+    "ext_rear",
+    "ext_left_side",
+    "ext_right_side",
+    "int_dashboard_wide",
+    "engine_bay_wide",
+}
+
+
+def normalized_step_groups() -> List[Dict[str, Any]]:
+    groups: List[Dict[str, Any]] = []
+    for group in STEP_GROUPS:
+        normalized_steps: List[Dict[str, Any]] = []
+        for step in group["steps"]:
+            normalized = dict(step)
+            normalized["required"] = normalized["stepKey"] in CORE_REQUIRED_STEP_KEYS
+            normalized_steps.append(normalized)
+        groups.append({"group": group["group"], "steps": normalized_steps})
+    return groups
+
 
 @app.get("/api/steps")
 def get_steps():
-    return STEP_GROUPS
+    return normalized_step_groups()
 
 
 @app.post("/api/admin/seed")
@@ -491,6 +507,7 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
             expires_at=expires_at,
             seller_name=payload.seller_name,
             seller_phone=payload.seller_phone,
+            seller_email=payload.seller_email,
             listing_id=payload.listing_id,
             vin=payload.vin,
             plate=payload.plate,
@@ -508,6 +525,10 @@ def create_session(payload: SessionCreate, admin=Depends(require_admin), db: Ses
         "token": token,
         "link": f"{APP_BASE_URL}/seller/{token}",
         "expires_at": expires_at,
+        "notifications": {
+            "sms": payload.seller_phone,
+            "email": payload.seller_email,
+        },
     }
 
 
@@ -620,68 +641,71 @@ def get_session(token: str, db: Session = Depends(get_db)):
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": [asset_response(dict(row._mapping), token) for row in assets],
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": find_next_step_key(db, session["id"]),
     }
 
 
-@app.post("/api/sessions/{token}/presign")
-def presign_upload(token: str, payload: PresignRequest, db: Session = Depends(get_db)):
-    session_id = get_session_id(db, token)
-    key = f"sessions/{session_id}/{secrets.token_hex(8)}-{payload.filename}"
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": key, "ContentType": payload.mime_type},
-        ExpiresIn=3600,
-    )
-    return {"uploadUrl": url, "s3Key": key}
+def asset_response(asset: Dict[str, Any], token: str) -> Dict[str, Any]:
+    preview_path = asset.get("thumb_url") or f"/api/sessions/{token}/assets/{asset['id']}/preview"
+    return {
+        **asset,
+        "preview_url": preview_path,
+    }
 
 
 @app.post("/api/sessions/{token}/assets")
-def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_db)):
+async def upload_asset(
+    token: str,
+    step_key: str = Form(...),
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
     session_id = get_session_id(db, token)
-    try:
-        obj = s3_client.get_object(Bucket=S3_BUCKET, Key=payload.s3_key)
-    except s3_client.exceptions.NoSuchKey as exc:
-        raise HTTPException(status_code=404, detail="Upload not found") from exc
+    mime_type = file.content_type or "application/octet-stream"
+    if not mime_type.startswith("image/"):
+        raise HTTPException(status_code=400, detail="Only image uploads are allowed")
 
-    data = obj["Body"].read()
+    data = await file.read()
     size_bytes = len(data)
     if size_bytes > 10 * 1024 * 1024:
         raise HTTPException(status_code=400, detail="File exceeds 10MB limit")
 
     width = 0
     height = 0
-    if payload.mime_type.startswith("image/"):
-        try:
-            image = Image.open(BytesIO(data))
-            image = ImageOps.exif_transpose(image)
-            width, height = image.size
-            if width < 1600 and height < 1600:
-                raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
-            buffer = BytesIO()
-            image.save(buffer, format=image.format or "JPEG")
-            buffer.seek(0)
-            s3_client.put_object(
-                Bucket=S3_BUCKET,
-                Key=payload.s3_key,
-                Body=buffer,
-                ContentType=payload.mime_type,
-            )
-        except HTTPException:
-            raise
-        except Exception as exc:  # pylint: disable=broad-except
-            raise HTTPException(status_code=400, detail="Invalid image") from exc
+    try:
+        image = Image.open(BytesIO(data))
+        image = ImageOps.exif_transpose(image)
+        width, height = image.size
+        if width < 1600 and height < 1600:
+            raise HTTPException(status_code=400, detail="Image too small (min 1600px on one side)")
+        buffer = BytesIO()
+        image.save(buffer, format=image.format or "JPEG")
+        buffer.seek(0)
+    except HTTPException:
+        raise
+    except Exception as exc:  # pylint: disable=broad-except
+        raise HTTPException(status_code=400, detail="Invalid image") from exc
 
-    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{payload.s3_key}"
+    safe_name = os.path.basename(file.filename or "upload.jpg")
+    s3_key = f"sessions/{session_id}/{secrets.token_hex(8)}-{safe_name}"
+    s3_client.put_object(
+        Bucket=S3_BUCKET,
+        Key=s3_key,
+        Body=buffer,
+        ContentType=mime_type,
+    )
+
+    file_url = f"{S3_ENDPOINT}/{S3_BUCKET}/{s3_key}"
     result = db.execute(
         insert(session_assets)
         .values(
             session_id=session_id,
-            step_key=payload.step_key,
+            step_key=step_key,
             file_url=file_url,
-            mime_type=payload.mime_type,
+            mime_type=mime_type,
             width=width,
             height=height,
             size_bytes=size_bytes,
@@ -689,13 +713,44 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
         .returning(session_assets.c.id)
     )
     asset_id = result.scalar_one()
+    preview_path = f"/api/sessions/{token}/assets/{asset_id}/preview"
+    db.execute(
+        update(session_assets)
+        .where(session_assets.c.id == asset_id)
+        .values(thumb_url=preview_path)
+    )
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "step_key": step_key,
+        "file_url": file_url,
+        "preview_url": preview_path,
+        "width": width,
+        "height": height,
+        "size_bytes": size_bytes,
+    }
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def asset_preview(token: str, asset_id: int, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    asset_row = db.execute(
+        select(session_assets).where(
+            session_assets.c.id == asset_id,
+            session_assets.c.session_id == session_id,
+        )
+    ).first()
+    if not asset_row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = asset_row._mapping
+    return RedirectResponse(url=asset["file_url"])
 
 
 @app.post("/api/sessions/{token}/submit")
 def submit_session(token: str, payload: SubmitRequest, db: Session = Depends(get_db)):
     session_id = get_session_id(db, token)
+    if not payload.agree_documents_redaction:
+        raise HTTPException(status_code=400, detail="Document redaction acknowledgement is required")
     missing = count_missing_required(db, session_id)
     if missing > 0:
         raise HTTPException(status_code=400, detail="Required steps are missing")
@@ -729,18 +784,37 @@ def get_session_id(db: Session, token: str) -> int:
 
 
 def count_missing_required(db: Session, session_id: int) -> int:
+    groups = normalized_step_groups()
     asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
     counts: Dict[str, int] = {}
     for row in asset_rows:
         step_key = row._mapping["step_key"]
         counts[step_key] = counts.get(step_key, 0) + 1
     missing = 0
-    for group in STEP_GROUPS:
+    for group in groups:
         for step in group["steps"]:
             if step["required"]:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
                     missing += 1
     return missing
+
+
+def find_next_step_key(db: Session, session_id: int) -> Optional[str]:
+    groups = normalized_step_groups()
+    all_steps = [step for group in groups for step in group["steps"]]
+    asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+
+    for step in all_steps:
+        if step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    for step in all_steps:
+        if not step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    return None
 
 
 @app.get("/api/health")
