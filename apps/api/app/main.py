@@ -7,7 +7,7 @@ from typing import Any, Dict, List, Optional
 import boto3
 from botocore.config import Config
 import jwt
-from fastapi import Depends, FastAPI, Header, HTTPException
+from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy import select, insert, update, delete
@@ -439,7 +439,7 @@ STEP_GROUPS = [
             {
                 "stepKey": "service_records_optional",
                 "title": "Service records",
-                "description": "Upload service history photos or PDFs.",
+                "description": "Capture clear photos of service history pages.",
                 "example": "/examples/service_records.jpg",
                 "required": False,
                 "minCount": 1,
@@ -449,10 +449,60 @@ STEP_GROUPS = [
     },
 ]
 
+REQUIRED_STEP_KEYS = {
+    "odometer_closeup",
+    "vin_windshield",
+    "plate_front_or_rear",
+    "keys_photo",
+    "ext_front",
+    "ext_rear",
+    "ext_left_side",
+    "ext_right_side",
+    "int_dashboard_wide",
+    "engine_bay_wide",
+}
+
+
+def get_normalized_step_groups() -> List[Dict[str, Any]]:
+    normalized_groups: List[Dict[str, Any]] = []
+    for group in STEP_GROUPS:
+        normalized_steps: List[Dict[str, Any]] = []
+        for step in group["steps"]:
+            normalized_step = dict(step)
+            normalized_step["required"] = normalized_step["stepKey"] in REQUIRED_STEP_KEYS
+            normalized_steps.append(normalized_step)
+        normalized_groups.append({"group": group["group"], "steps": normalized_steps})
+    return normalized_groups
+
+
+def get_normalized_steps_flat() -> List[Dict[str, Any]]:
+    return [step for group in get_normalized_step_groups() for step in group["steps"]]
+
+
+def get_asset_counts(db: Session, session_id: int) -> Dict[str, int]:
+    asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
+    counts: Dict[str, int] = {}
+    for row in asset_rows:
+        step_key = row._mapping["step_key"]
+        counts[step_key] = counts.get(step_key, 0) + 1
+    return counts
+
+
+def find_next_step_key(db: Session, session_id: int) -> Optional[str]:
+    counts = get_asset_counts(db, session_id)
+    steps = get_normalized_steps_flat()
+    for step in steps:
+        if step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    for step in steps:
+        if not step["required"] and counts.get(step["stepKey"], 0) < step["minCount"]:
+            return step["stepKey"]
+    return None
+
 
 @app.get("/api/steps")
 def get_steps():
-    return STEP_GROUPS
+    return get_normalized_step_groups()
 
 
 @app.post("/api/admin/seed")
@@ -618,11 +668,17 @@ def get_session(token: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=410, detail="Session expired")
     assets = db.execute(select(session_assets).where(session_assets.c.session_id == session["id"])).fetchall()
     reviews = db.execute(select(session_reviews).where(session_reviews.c.session_id == session["id"])).fetchall()
+    asset_payload = []
+    for row in assets:
+        asset = dict(row._mapping)
+        asset["preview_url"] = f"/api/sessions/{token}/assets/{asset['id']}/preview"
+        asset_payload.append(asset)
     return {
         "session": dict(session),
-        "assets": [dict(row._mapping) for row in assets],
+        "assets": asset_payload,
         "reviews": [dict(row._mapping) for row in reviews],
         "missing_required": count_missing_required(db, session["id"]),
+        "next_step_key": find_next_step_key(db, session["id"]),
     }
 
 
@@ -690,7 +746,29 @@ def confirm_asset(token: str, payload: AssetConfirm, db: Session = Depends(get_d
     )
     asset_id = result.scalar_one()
     db.commit()
-    return {"id": asset_id, "fileUrl": file_url, "width": width, "height": height, "sizeBytes": size_bytes}
+    return {
+        "id": asset_id,
+        "fileUrl": file_url,
+        "previewUrl": f"/api/sessions/{token}/assets/{asset_id}/preview",
+        "width": width,
+        "height": height,
+        "sizeBytes": size_bytes,
+    }
+
+
+@app.get("/api/sessions/{token}/assets/{asset_id}/preview")
+def preview_asset(token: str, asset_id: int, db: Session = Depends(get_db)):
+    session_id = get_session_id(db, token)
+    row = db.execute(
+        select(session_assets).where(session_assets.c.id == asset_id, session_assets.c.session_id == session_id)
+    ).first()
+    if not row:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    asset = row._mapping
+    key = asset["file_url"].replace(f"{S3_ENDPOINT}/{S3_BUCKET}/", "", 1)
+    obj = s3_client.get_object(Bucket=S3_BUCKET, Key=key)
+    content_type = asset["mime_type"] or "application/octet-stream"
+    return Response(content=obj["Body"].read(), media_type=content_type)
 
 
 @app.post("/api/sessions/{token}/submit")
@@ -729,13 +807,9 @@ def get_session_id(db: Session, token: str) -> int:
 
 
 def count_missing_required(db: Session, session_id: int) -> int:
-    asset_rows = db.execute(select(session_assets).where(session_assets.c.session_id == session_id)).fetchall()
-    counts: Dict[str, int] = {}
-    for row in asset_rows:
-        step_key = row._mapping["step_key"]
-        counts[step_key] = counts.get(step_key, 0) + 1
+    counts = get_asset_counts(db, session_id)
     missing = 0
-    for group in STEP_GROUPS:
+    for group in get_normalized_step_groups():
         for step in group["steps"]:
             if step["required"]:
                 if counts.get(step["stepKey"], 0) < step["minCount"]:
