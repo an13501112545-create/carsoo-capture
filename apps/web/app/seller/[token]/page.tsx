@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { resolvePreviewUrl } from '../../../lib/preview-url';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -22,7 +23,7 @@ interface StepGroup {
 interface Asset {
   id: number;
   step_key: string;
-  file_url: string;
+  preview_url?: string;
 }
 
 interface Review {
@@ -118,7 +119,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
         throw new Error(error.detail || 'Upload failed');
       }
       const confirmData = await confirmResp.json();
-      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, file_url: confirmData.fileUrl }]);
+      setAssets((prev) => [...prev, { id: confirmData.id, step_key: step.stepKey, preview_url: confirmData.preview_url }]);
     } catch (error: any) {
       setNotice(error.message);
     } finally {
@@ -208,12 +209,12 @@ export default function SellerCapturePage({ params }: { params: { token: string 
                 disabled={uploading}
                 onChange={(event) => handleUpload(event, activeStep)}
               />
-              <div className="thumb-list" style={{ marginTop: '1rem' }}>
-                {(assetMap[activeStep.stepKey] || []).map((asset) => (
-                  <img key={asset.id} src={asset.file_url} className="thumb" alt={activeStep.title} />
-                ))}
+                <div className="thumb-list" style={{ marginTop: '1rem' }}>
+                  {(assetMap[activeStep.stepKey] || []).map((asset) => (
+                    <img key={asset.id} src={resolvePreviewUrl(asset.preview_url)} className="thumb" alt={activeStep.title} />
+                  ))}
+                </div>
               </div>
-            </div>
           ) : (
             <p>Select a step to begin capturing.</p>
           )}
