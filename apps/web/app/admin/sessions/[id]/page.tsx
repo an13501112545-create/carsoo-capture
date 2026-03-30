@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useState } from 'react';
+import { resolvePreviewUrl } from '../../../../lib/preview-url';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -129,7 +130,7 @@ export default function AdminReviewPage({ params }: { params: { id: string } }) 
                 <h3>{step.title}</h3>
                 <div className="thumb-list">
                   {assets.map((asset) => (
-                    <img key={asset.id} className="thumb" src={`${API_BASE}${asset.preview_url}`} alt={step.title} />
+                    <img key={asset.id} className="thumb" src={resolvePreviewUrl(asset.preview_url)} alt={step.title} />
                   ))}
                 </div>
                 <div className="grid two" style={{ marginTop: '0.5rem' }}>

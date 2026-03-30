@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useMemo, useRef, useState } from 'react';
+import { resolvePreviewUrl } from '../../../lib/preview-url';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE || 'http://localhost:8000';
 
@@ -181,7 +182,7 @@ export default function SellerCapturePage({ params }: { params: { token: string 
 
         <div className="thumb-list" style={{ marginTop: '1rem' }}>
           {activeAssets.map((asset) => (
-            <img key={asset.id} src={`${API_BASE}${asset.preview_url}`} className="thumb" alt={activeStep.title} />
+            <img key={asset.id} src={resolvePreviewUrl(asset.preview_url)} className="thumb" alt={activeStep.title} />
           ))}
         </div>
 
