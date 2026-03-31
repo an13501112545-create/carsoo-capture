@@ -14,12 +14,25 @@ interface SessionRow {
   missing_required: number;
 }
 
+interface NotificationChannel {
+  to?: string;
+  message?: string;
+  subject?: string;
+  body?: string;
+}
+
+interface CreateSessionNotifications {
+  sms?: NotificationChannel | null;
+  email?: NotificationChannel | null;
+}
+
 export default function AdminSessionsPage() {
   const [sessions, setSessions] = useState<SessionRow[]>([]);
   const [notice, setNotice] = useState('');
   const [form, setForm] = useState({
     seller_name: '',
     seller_phone: '',
+    seller_email: '',
     listing_id: '',
     vin: '',
     plate: '',
@@ -29,6 +42,7 @@ export default function AdminSessionsPage() {
     vehicle_year: ''
   });
   const [link, setLink] = useState('');
+  const [notifications, setNotifications] = useState<CreateSessionNotifications | null>(null);
 
   const loadSessions = async () => {
     const token = localStorage.getItem('carsoo_admin_token');
@@ -51,6 +65,7 @@ export default function AdminSessionsPage() {
   const createSession = async () => {
     setNotice('');
     setLink('');
+    setNotifications(null);
     const token = localStorage.getItem('carsoo_admin_token');
     if (!token) {
       setNotice('Please login again.');
@@ -67,6 +82,7 @@ export default function AdminSessionsPage() {
     }
     const data = await resp.json();
     setLink(data.link);
+    setNotifications(data.notifications || null);
     await loadSessions();
   };
 
@@ -78,7 +94,24 @@ export default function AdminSessionsPage() {
           {notice && <div className="alert">{notice}</div>}
           {link && (
             <div className="alert">
-              Seller link: <a href={link}>{link}</a>
+              <p>
+                Seller link: <a href={link}>{link}</a>
+              </p>
+              {notifications?.sms && (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <strong>SMS</strong>
+                  <p>To: {notifications.sms.to || '-'}</p>
+                  <p>Message: {notifications.sms.message || '-'}</p>
+                </div>
+              )}
+              {notifications?.email && (
+                <div style={{ marginTop: '0.75rem' }}>
+                  <strong>Email</strong>
+                  <p>To: {notifications.email.to || '-'}</p>
+                  <p>Subject: {notifications.email.subject || '-'}</p>
+                  <p>Body: {notifications.email.body || '-'}</p>
+                </div>
+              )}
             </div>
           )}
           <div className="grid two">
@@ -89,6 +122,10 @@ export default function AdminSessionsPage() {
             <label>
               Seller phone
               <input value={form.seller_phone} onChange={(e) => setForm({ ...form, seller_phone: e.target.value })} />
+            </label>
+            <label>
+              Seller email
+              <input value={form.seller_email} onChange={(e) => setForm({ ...form, seller_email: e.target.value })} />
             </label>
             <label>
               Listing ID
