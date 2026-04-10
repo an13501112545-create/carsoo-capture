@@ -146,6 +146,26 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const activeAssets = assetMap[activeStep.stepKey] || [];
   const retakeRequested = reviewMap[activeStep.stepKey]?.decision === 'retake';
 
+
+  if (sessionStatus === 'submitted') {
+    return (
+      <main>
+        <div className="card">
+          <h1>Seller Capture Session</h1>
+          <p>Status: <span className="tag">{sessionStatus}</span></p>
+          <p>Required progress: {completedRequired}/{requiredSteps.length}</p>
+          {notice && <div className="alert">{notice}</div>}
+        </div>
+
+        <div className="card" style={{ marginTop: '1rem' }}>
+          <h2>Submission received</h2>
+          <p>Your photos have been submitted successfully.</p>
+          <p>Our team will review the session and follow up if anything else is needed.</p>
+        </div>
+      </main>
+    );
+  }
+
   return (
     <main>
       <div className="card">
