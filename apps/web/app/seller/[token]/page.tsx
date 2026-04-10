@@ -32,7 +32,6 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const [assets, setAssets] = useState<Asset[]>([]);
   const [reviews, setReviews] = useState<Review[]>([]);
   const [sessionStatus, setSessionStatus] = useState<string>('draft');
-  const [missingRequired, setMissingRequired] = useState<number>(0);
   const [activeIndex, setActiveIndex] = useState<number>(0);
   const [loading, setLoading] = useState<boolean>(true);
   const [uploading, setUploading] = useState<boolean>(false);
@@ -52,7 +51,6 @@ export default function SellerCapturePage({ params }: { params: { token: string 
       setAssets(sessionData.assets || []);
       setReviews(sessionData.reviews || []);
       setSessionStatus(sessionData.session.status);
-      setMissingRequired(sessionData.missing_required || 0);
       const nextStepKey = sessionData.next_step_key;
       const nextIndex = (stepsData || []).findIndex((step: Step) => step.stepKey === nextStepKey);
       setActiveIndex(nextIndex >= 0 ? nextIndex : 0);
@@ -84,6 +82,12 @@ export default function SellerCapturePage({ params }: { params: { token: string 
   const completedRequired = useMemo(
     () => requiredSteps.filter((step) => (assetMap[step.stepKey] || []).length >= step.minCount).length,
     [requiredSteps, assetMap]
+  );
+
+
+  const missingRequired = useMemo(
+    () => (sessionStatus === 'submitted' ? 0 : Math.max(requiredSteps.length - completedRequired, 0)),
+    [sessionStatus, requiredSteps.length, completedRequired]
   );
 
   const openFilePicker = () => {
